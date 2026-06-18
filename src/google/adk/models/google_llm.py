@@ -31,6 +31,7 @@ from urllib.parse import urlunparse
 
 from google.genai import types
 from google.genai.errors import ClientError
+from pydantic import Field
 from typing_extensions import override
 
 from ..utils._google_client_headers import get_tracking_headers
@@ -113,6 +114,11 @@ class Gemini(BaseLlm):
   """
 
   model: str = 'gemini-2.5-flash'
+
+  client_kwargs: Optional[dict[str, Any]] = Field(
+      default=None, exclude=True, repr=False
+  )
+  """Extra arguments to pass to the google.genai.Client constructor."""
 
   base_url: Optional[str] = None
   """The base URL for the AI platform service endpoint."""
@@ -349,6 +355,9 @@ class Gemini(BaseLlm):
     if self.model.startswith('projects/'):
       kwargs['enterprise'] = True
 
+    if self.client_kwargs:
+      kwargs.update(self.client_kwargs)
+
     return Client(**kwargs)
 
   @cached_property
@@ -393,6 +402,9 @@ class Gemini(BaseLlm):
     }
     if self.model.startswith('projects/'):
       kwargs['enterprise'] = True
+
+    if self.client_kwargs:
+      kwargs.update(self.client_kwargs)
 
     return Client(**kwargs)
 
@@ -455,6 +467,10 @@ class Gemini(BaseLlm):
             ' backend. Please use Vertex AI backend.'
         )
     llm_request.live_connect_config.tools = llm_request.config.tools
+    if llm_request.config.thinking_config is not None:
+      llm_request.live_connect_config.thinking_config = (
+          llm_request.config.thinking_config
+      )
     logger.debug('Connecting to live with llm_request:%s', llm_request)
     logger.debug('Live connect config: %s', llm_request.live_connect_config)
     async with self._live_api_client.aio.live.connect(
@@ -614,11 +630,30 @@ def _build_response_log(resp: types.GenerateContentResponse) -> str:
       function_calls_text.append(
           f'name: {func_call.name}, args: {func_call.args}'
       )
+  # Avoid accessing resp.text directly: the genai SDK raises a UserWarning
+  # whenever .text is accessed on a response that contains non-text parts
+  # (e.g. function_call). This floods logs on every tool invocation.
+  # Instead, manually join only the text parts from candidates.
+  text_parts = []
+  # Mimic resp.text behavior exactly but without triggering linter warnings:
+  # 1. Only use the first candidate.
+  # 2. Exclude thought/reasoning parts.
+  if (
+      resp.candidates
+      and resp.candidates[0].content
+      and resp.candidates[0].content.parts
+  ):
+    for part in resp.candidates[0].content.parts:
+      if isinstance(part.text, str):
+        if getattr(part, 'thought', False):
+          continue
+        text_parts.append(part.text)
+  text = ''.join(text_parts)
   return f"""
 LLM Response:
 -----------------------------------------------------------
 Text:
-{resp.text}
+{text}
 -----------------------------------------------------------
 Function calls:
 {_NEW_LINE.join(function_calls_text)}
