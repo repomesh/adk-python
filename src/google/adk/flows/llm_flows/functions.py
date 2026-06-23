@@ -198,6 +198,20 @@ async def _call_tool_in_thread_pool(
         args_to_call = {
             k: v for k, v in args_to_call.items() if k in valid_params
         }
+        mandatory_args = tool._get_mandatory_args()
+        missing_mandatory_args = [
+            arg for arg in mandatory_args if arg not in args_to_call
+        ]
+        if missing_mandatory_args:
+          missing_mandatory_args_str = '\n'.join(missing_mandatory_args)
+          error_str = (
+              f'Invoking `{tool.name}()` failed as the following mandatory'
+              ' input parameters are not present:\n'
+              f'{missing_mandatory_args_str}\n'
+              'You could retry calling this tool, but it is IMPORTANT for you'
+              ' to provide all the mandatory parameters.'
+          )
+          return {'error': error_str}
         return tool.func(**args_to_call)
 
       return await loop.run_in_executor(
@@ -1221,17 +1235,10 @@ def _build_function_response_content(
 
 
 def deep_merge_dicts(d1: dict, d2: dict) -> dict:
-  """Recursively merges d2 into d1.
-
-  For dict values, merges recursively. For list values, concatenates instead of
-  overwriting so that parallel tool calls don't silently drop list entries
-  (e.g. state_delta lists from concurrent function responses).
-  """
+  """Recursively merges d2 into d1."""
   for key, value in d2.items():
     if key in d1 and isinstance(d1[key], dict) and isinstance(value, dict):
       d1[key] = deep_merge_dicts(d1[key], value)
-    elif key in d1 and isinstance(d1[key], list) and isinstance(value, list):
-      d1[key] = d1[key] + value
     else:
       d1[key] = value
   return d1
