@@ -20,6 +20,7 @@ from datetime import datetime
 import enum
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from typing import Optional
 from typing import Union
@@ -28,6 +29,7 @@ from unittest.mock import patch
 from urllib.parse import unquote
 from urllib.parse import urlparse
 
+from google.adk.artifacts import file_artifact_service
 from google.adk.artifacts.base_artifact_service import ArtifactVersion
 from google.adk.artifacts.base_artifact_service import ensure_part
 from google.adk.artifacts.file_artifact_service import FileArtifactService
@@ -817,66 +819,295 @@ async def test_file_save_artifact_rejects_out_of_scope_paths(
     )
 
 
+INVALID_PATH_SEGMENT_CASES = [
+    ("../escape", "must not contain path separators"),
+    ("../../etc", "must not contain path separators"),
+    ("foo/../../bar", "must not contain path separators"),
+    ("..", "must not contain traversal segments"),
+    (".", "must not contain traversal segments"),
+    ("has/slash", "must not contain path separators"),
+    ("back\\slash", "must not contain path separators"),
+    ("null\x00byte", "must not contain null bytes"),
+    ("", "must not be empty"),
+]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "user_id",
+    "service_type",
     [
-        "../escape",
-        "../../etc",
-        "foo/../../bar",
-        "valid/../..",
-        "..",
-        ".",
-        "has/slash",
-        "back\\slash",
-        "null\x00byte",
-        "",
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
     ],
 )
-async def test_file_save_artifact_rejects_traversal_in_user_id(
-    tmp_path, user_id
+@pytest.mark.parametrize("app_name,match", INVALID_PATH_SEGMENT_CASES)
+async def test_save_artifact_rejects_traversal_in_app_name(
+    service_type, app_name, match, artifact_service_factory
 ):
-  """FileArtifactService rejects user_id values that escape root_dir."""
-  artifact_service = FileArtifactService(root_dir=tmp_path / "artifacts")
-  part = types.Part(text="content")
-  with pytest.raises(InputValidationError):
-    await artifact_service.save_artifact(
-        app_name="myapp",
-        user_id=user_id,
-        session_id="sess123",
-        filename="safe.txt",
-        artifact=part,
+  """In-memory and GCS ArtifactService implementations reject app_name values that escape directory."""
+  service = artifact_service_factory(service_type)
+  artifact = types.Part.from_bytes(data=b"data", mime_type="text/plain")
+  with pytest.raises(InputValidationError, match=match):
+    await service.save_artifact(
+        app_name=app_name,
+        user_id="user123",
+        filename="user:safe.txt",
+        artifact=artifact,
     )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "session_id",
+    "service_type",
     [
-        "../escape",
-        "../../tmp",
-        "foo/../../bar",
-        "..",
-        ".",
-        "has/slash",
-        "back\\slash",
-        "null\x00byte",
-        "",
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+        ArtifactServiceType.FILE,
     ],
 )
-async def test_file_save_artifact_rejects_traversal_in_session_id(
-    tmp_path, session_id
+@pytest.mark.parametrize("user_id,match", INVALID_PATH_SEGMENT_CASES)
+async def test_save_artifact_rejects_traversal_in_user_id(
+    service_type, user_id, match, artifact_service_factory
 ):
-  """FileArtifactService rejects session_id values that escape root_dir."""
-  artifact_service = FileArtifactService(root_dir=tmp_path / "artifacts")
-  part = types.Part(text="content")
-  with pytest.raises(InputValidationError):
-    await artifact_service.save_artifact(
+  """ArtifactService implementations reject user_id values that escape directory."""
+  service = artifact_service_factory(service_type)
+  artifact = types.Part.from_bytes(data=b"data", mime_type="text/plain")
+  with pytest.raises(InputValidationError, match=match):
+    await service.save_artifact(
+        app_name="myapp",
+        user_id=user_id,
+        filename="user:safe.txt",
+        artifact=artifact,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+        ArtifactServiceType.FILE,
+    ],
+)
+@pytest.mark.parametrize("session_id,match", INVALID_PATH_SEGMENT_CASES)
+async def test_save_artifact_rejects_traversal_in_session_id(
+    service_type, session_id, match, artifact_service_factory
+):
+  """ArtifactService implementations reject session_id values that escape directory."""
+  service = artifact_service_factory(service_type)
+  artifact = types.Part.from_bytes(data=b"data", mime_type="text/plain")
+  with pytest.raises(InputValidationError, match=match):
+    await service.save_artifact(
         app_name="myapp",
         user_id="user123",
         session_id=session_id,
         filename="safe.txt",
-        artifact=part,
+        artifact=artifact,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+    ],
+)
+@pytest.mark.parametrize("app_name,match", INVALID_PATH_SEGMENT_CASES)
+async def test_load_artifact_rejects_traversal_in_app_name(
+    service_type, app_name, match, artifact_service_factory
+):
+  """In-memory and GCS ArtifactService implementations reject app_name values that escape directory."""
+  service = artifact_service_factory(service_type)
+  with pytest.raises(InputValidationError, match=match):
+    await service.load_artifact(
+        app_name=app_name,
+        user_id="user123",
+        filename="user:safe.txt",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+        ArtifactServiceType.FILE,
+    ],
+)
+@pytest.mark.parametrize("user_id,match", INVALID_PATH_SEGMENT_CASES)
+async def test_load_artifact_rejects_traversal_in_user_id(
+    service_type, user_id, match, artifact_service_factory
+):
+  """ArtifactService implementations reject user_id values that escape directory."""
+  service = artifact_service_factory(service_type)
+  with pytest.raises(InputValidationError, match=match):
+    await service.load_artifact(
+        app_name="myapp",
+        user_id=user_id,
+        filename="user:safe.txt",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+        ArtifactServiceType.FILE,
+    ],
+)
+@pytest.mark.parametrize("session_id,match", INVALID_PATH_SEGMENT_CASES)
+async def test_load_artifact_rejects_traversal_in_session_id(
+    service_type, session_id, match, artifact_service_factory
+):
+  """ArtifactService implementations reject session_id values that escape directory."""
+  service = artifact_service_factory(service_type)
+  with pytest.raises(InputValidationError, match=match):
+    await service.load_artifact(
+        app_name="myapp",
+        user_id="user123",
+        session_id=session_id,
+        filename="safe.txt",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+    ],
+)
+@pytest.mark.parametrize("app_name,match", INVALID_PATH_SEGMENT_CASES)
+async def test_delete_artifact_rejects_traversal_in_app_name(
+    service_type, app_name, match, artifact_service_factory
+):
+  """In-memory and GCS ArtifactService implementations reject app_name values that escape directory."""
+  service = artifact_service_factory(service_type)
+  with pytest.raises(InputValidationError, match=match):
+    await service.delete_artifact(
+        app_name=app_name,
+        user_id="user123",
+        filename="user:safe.txt",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+        ArtifactServiceType.FILE,
+    ],
+)
+@pytest.mark.parametrize("user_id,match", INVALID_PATH_SEGMENT_CASES)
+async def test_delete_artifact_rejects_traversal_in_user_id(
+    service_type, user_id, match, artifact_service_factory
+):
+  """ArtifactService implementations reject user_id values that escape directory."""
+  service = artifact_service_factory(service_type)
+  with pytest.raises(InputValidationError, match=match):
+    await service.delete_artifact(
+        app_name="myapp",
+        user_id=user_id,
+        filename="user:safe.txt",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+        ArtifactServiceType.FILE,
+    ],
+)
+@pytest.mark.parametrize("session_id,match", INVALID_PATH_SEGMENT_CASES)
+async def test_delete_artifact_rejects_traversal_in_session_id(
+    service_type, session_id, match, artifact_service_factory
+):
+  """ArtifactService implementations reject session_id values that escape directory."""
+  service = artifact_service_factory(service_type)
+  with pytest.raises(InputValidationError, match=match):
+    await service.delete_artifact(
+        app_name="myapp",
+        user_id="user123",
+        session_id=session_id,
+        filename="safe.txt",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+    ],
+)
+@pytest.mark.parametrize("app_name,match", INVALID_PATH_SEGMENT_CASES)
+async def test_list_artifact_keys_rejects_traversal_in_app_name(
+    service_type, app_name, match, artifact_service_factory
+):
+  """In-memory and GCS ArtifactService implementations reject app_name values that escape directory."""
+  service = artifact_service_factory(service_type)
+  with pytest.raises(InputValidationError, match=match):
+    await service.list_artifact_keys(
+        app_name=app_name,
+        user_id="user123",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+        ArtifactServiceType.FILE,
+    ],
+)
+@pytest.mark.parametrize("user_id,match", INVALID_PATH_SEGMENT_CASES)
+async def test_list_artifact_keys_rejects_traversal_in_user_id(
+    service_type, user_id, match, artifact_service_factory
+):
+  """ArtifactService implementations reject user_id values that escape directory."""
+  service = artifact_service_factory(service_type)
+  with pytest.raises(InputValidationError, match=match):
+    await service.list_artifact_keys(
+        app_name="myapp",
+        user_id=user_id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+        ArtifactServiceType.FILE,
+    ],
+)
+@pytest.mark.parametrize("session_id,match", INVALID_PATH_SEGMENT_CASES)
+async def test_list_artifact_keys_rejects_traversal_in_session_id(
+    service_type, session_id, match, artifact_service_factory
+):
+  """ArtifactService implementations reject session_id values that escape directory."""
+  service = artifact_service_factory(service_type)
+  with pytest.raises(InputValidationError, match=match):
+    await service.list_artifact_keys(
+        app_name="myapp",
+        user_id="user123",
+        session_id=session_id,
     )
 
 
@@ -1591,3 +1822,25 @@ async def test_save_load_empty_text_artifact(
   assert loaded is not None
   assert loaded.text == ""
   assert loaded.inline_data is None
+
+
+def test_file_uri_to_path_normalizes_windows_file_uri(monkeypatch):
+  monkeypatch.setattr(file_artifact_service, "os", SimpleNamespace(name="nt"))
+  mocked_url2pathname = mock.Mock(return_value=r"C:\tmp\adk artifacts")
+  monkeypatch.setattr(
+      file_artifact_service, "url2pathname", mocked_url2pathname
+  )
+
+  result = file_artifact_service._file_uri_to_path(
+      "file:///C:/tmp/adk%20artifacts"
+  )
+
+  mocked_url2pathname.assert_called_once_with("/C:/tmp/adk artifacts")
+  assert result == Path(r"C:\tmp\adk artifacts")
+
+
+def test_file_uri_to_path_returns_none_for_non_file_uri():
+  assert (
+      file_artifact_service._file_uri_to_path("gs://bucket/adk_artifacts")
+      is None
+  )
