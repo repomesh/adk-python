@@ -806,6 +806,8 @@ class BaseLlmFlow(ABC):
 
       if live_request.content:
         content = live_request.content
+        if content.parts and any(p.function_call for p in content.parts):
+          raise ValueError('User message cannot contain function calls.')
         # Persist user text content to session (similar to non-live mode)
         # Skip function responses - they are already handled separately
         is_function_response = content.parts and any(
@@ -1171,6 +1173,7 @@ class BaseLlmFlow(ABC):
         and not llm_response.usage_metadata
         and not llm_response.live_session_resumption_update
         and not llm_response.grounding_metadata
+        and not llm_response.voice_activity
     ):
       return
 
@@ -1179,6 +1182,12 @@ class BaseLlmFlow(ABC):
       model_response_event.live_session_resumption_update = (
           llm_response.live_session_resumption_update
       )
+      yield model_response_event
+      return
+
+    # Handle voice activity events
+    if llm_response.voice_activity:
+      model_response_event.voice_activity = llm_response.voice_activity
       yield model_response_event
       return
 
