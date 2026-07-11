@@ -763,6 +763,63 @@ def test_run_async_non_streaming_final_event_carries_grounding_and_usage():
   assert final.usage_metadata.candidates_token_count == 7
 
 
+def test_mode_defaults_to_none():
+  agent = ManagedAgent(name='m', agent_id='a')
+  assert agent.mode is None
+
+
+def test_mode_single_turn_is_accepted():
+  agent = ManagedAgent(name='m', agent_id='a', mode='single_turn')
+  assert agent.mode == 'single_turn'
+
+
+def test_mode_chat_is_rejected():
+  from pydantic import ValidationError
+
+  with pytest.raises(ValidationError):
+    ManagedAgent(name='m', agent_id='a', mode='chat')
+
+
+async def test_run_impl_bridges_node_input_to_user_content():
+  from google.adk.agents.context import Context
+  from google.adk.agents.invocation_context import InvocationContext
+  from google.adk.sessions.in_memory_session_service import InMemorySessionService
+  from google.adk.sessions.session import Session
+  from google.adk.utils.content_utils import to_user_content
+
+  captured = {}
+
+  # ManagedAgent is a Pydantic model, so `run_async` cannot be reassigned on an
+  # instance; subclassing to override it is the pydantic-safe equivalent of
+  # stubbing it. The override captures the `parent_context.user_content` that
+  # `_run_impl` threads in from `node_input`.
+  class _CapturingManagedAgent(ManagedAgent):
+
+    async def run_async(self, parent_context):
+      captured['user_content'] = parent_context.user_content
+      return
+      yield  # make this an async generator
+
+  agent = _CapturingManagedAgent(name='m', agent_id='a', mode='single_turn')
+
+  # Build a minimal node Context (mirrors
+  # tests/unittests/workflow/test_agent_node.py).
+  session = Session(app_name='test', user_id='user', id='session')
+  ic = InvocationContext(
+      invocation_id='inv',
+      session=session,
+      session_service=InMemorySessionService(),
+  )
+  ctx = Context(ic, node_path='wf')
+
+  events = [
+      e async for e in agent._run_impl(ctx=ctx, node_input='compute primes')
+  ]
+
+  assert events == []
+  assert captured['user_content'] == to_user_content('compute primes')
+
+
 async def _drain(agen):
   async for _ in agen:
     pass
