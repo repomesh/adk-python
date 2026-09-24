@@ -17,15 +17,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import ssl
 import tempfile
 from typing import Any
+from urllib.parse import quote
 
 from google.adk.skills import _utils
 from google.adk.skills import models
 from google.adk.skills.skill_registry import SkillRegistry
 from google.adk.utils import _mtls_utils
+from google.adk.utils._google_client_headers import merge_tracking_headers
 import google.auth
 import google.auth.credentials
 from google.auth.credentials import Credentials
@@ -33,6 +36,9 @@ import google.auth.exceptions
 from google.auth.transport import mtls
 from google.auth.transport import requests as auth_requests
 import httpx
+from pydantic import ValidationError
+
+logger = logging.getLogger("google_adk." + __name__)
 
 
 class GCPSkillRegistry(SkillRegistry):
@@ -126,7 +132,7 @@ class GCPSkillRegistry(SkillRegistry):
     }
     if quota_project_id:
       headers["x-goog-user-project"] = quota_project_id
-    return headers
+    return merge_tracking_headers(headers)
 
   async def _make_request(
       self,
@@ -164,12 +170,27 @@ class GCPSkillRegistry(SkillRegistry):
 
     Returns:
       A Skill object.
+
+    Raises:
+      ValueError: If the name is not a valid skill name.
     """
+    # The name reaches here straight from a model-issued tool call, so it must
+    # be a single path segment before it is interpolated into the request URL.
+    # Accept the same character set skill names are already held to; the
+    # snake-or-kebab pattern is the superset of the two accepted spellings.
+    # pylint: disable-next=protected-access
+    if not models._SNAKE_OR_KEBAB_NAME_PATTERN.match(name):
+      raise ValueError(
+          f"Invalid skill name {name!r}: name must be lowercase kebab-case"
+          " (a-z, 0-9, hyphens) or snake_case (a-z, 0-9, underscores), with"
+          " no leading, trailing, or consecutive delimiters."
+      )
+
     async with self._create_httpx_client() as client:
       # 1. Fetch the logical Skill metadata
       skill_url = (
           f"{self.base_url}/projects/{self.project_id}/"
-          f"locations/{self.location}/skills/{name}"
+          f"locations/{self.location}/skills/{quote(name, safe='')}"
       )
       response = await self._make_request(client, skill_url)
       skill_data = response.json()
@@ -189,7 +210,11 @@ class GCPSkillRegistry(SkillRegistry):
       zip_bytes = media_response.content
 
     # pylint: disable=protected-access
-    return await asyncio.to_thread(_utils._load_skill_from_zip_bytes, zip_bytes)
+    skill = await asyncio.to_thread(
+        _utils._load_skill_from_zip_bytes, zip_bytes
+    )
+    skill._uri = revision_url
+    return skill
 
   async def search_skills(self, *, query: str) -> list[models.Frontmatter]:
     """Searches for skills in the registry.
@@ -198,7 +223,10 @@ class GCPSkillRegistry(SkillRegistry):
       query: The search query.
 
     Returns:
-      A list of Frontmatter objects for discovery.
+      A list of Frontmatter objects for discovery. A catalog entry that fails
+      client-side frontmatter validation is skipped and logged, not raised: the
+      caller does not control what the catalog holds, so one entry it never
+      asked about must not break discovery for everything else.
     """
     async with self._create_httpx_client() as client:
       url = (
@@ -213,10 +241,23 @@ class GCPSkillRegistry(SkillRegistry):
 
       results = []
       for s in response_data.get("skills", []):
-        results.append(
-            models.Frontmatter(
-                name=s.get("name", "").split("/")[-1],
-                description=s.get("description", "") or "",
-            )
-        )
+        # A non-string name is as much outside the caller's control as a
+        # non-conforming one, so give it the same treatment: an empty name
+        # fails validation below and takes the skip path.
+        raw_name = s.get("name")
+        name = raw_name.split("/")[-1] if isinstance(raw_name, str) else ""
+        try:
+          results.append(
+              models.Frontmatter(
+                  name=name,
+                  description=s.get("description", "") or "",
+              )
+          )
+        except ValidationError as e:
+          logger.warning(
+              "Skipping search result %r: it does not pass frontmatter"
+              " validation: %s",
+              name,
+              e,
+          )
       return results

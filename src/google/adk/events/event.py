@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 from typing import Any
-from typing import cast
 from typing import Optional
 
 from google.adk.platform import time as platform_time
@@ -24,9 +23,11 @@ from pydantic import alias_generators
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import field_serializer
 from pydantic import model_validator
 
 from ..models.llm_response import LlmResponse
+from ._node_path_builder import _NodePathBuilder
 from .event_actions import EventActions
 
 
@@ -65,16 +66,12 @@ class NodeInfo(BaseModel):
   @property
   def run_id(self) -> str:
     """The run ID of the node that generated the event."""
-    from ._node_path_builder import _NodePathBuilder
-
     return _NodePathBuilder.from_string(self.path).run_id or ''
 
   @property
   def parent_run_id(self) -> str | None:
     """The run ID of the parent node that dynamically scheduled
     this node. Used to reconstruct dynamic node state from session events."""
-    from ._node_path_builder import _NodePathBuilder
-
     builder = _NodePathBuilder.from_string(self.path)
     if builder.parent:
       return builder.parent.run_id
@@ -83,8 +80,6 @@ class NodeInfo(BaseModel):
   @property
   def name(self) -> str:
     """The clean name of the node (without @run_id)."""
-    from ._node_path_builder import _NodePathBuilder
-
     return _NodePathBuilder.from_string(self.path).node_name
 
 
@@ -123,6 +118,7 @@ class Event(LlmResponse):
   Agent client will know from this field about which function call is long running.
   only valid for function call event
   """
+
   branch: str | None = None
   """The branch of the event.
 
@@ -153,6 +149,17 @@ class Event(LlmResponse):
   """The unique identifier of the event."""
   timestamp: float = Field(default_factory=lambda: platform_time.get_time())
   """The timestamp of the event."""
+
+  @field_serializer('long_running_tool_ids')
+  def _serialize_long_running_tool_ids(
+      self, value: set[str] | None
+  ) -> list[str] | None:
+    # A set has no defined iteration order and string hashing is randomized per
+    # process, so the default serialization emits these ids in a different
+    # order every run. Clients that diff serialized events would then see an
+    # unchanged event as changed on every fetch. Emit a sorted list so the same
+    # event always serializes identically.
+    return None if value is None else sorted(value)
 
   @model_validator(mode='before')
   @classmethod
@@ -267,7 +274,7 @@ class Event(LlmResponse):
       return ''
     return self.node_info.name
 
-  def model_post_init(self, __context):
+  def model_post_init(self, __context: Any) -> None:
     """Post initialization logic for the event."""
     # Generates a random ID for the event.
     if not self.id:
@@ -283,6 +290,12 @@ class Event(LlmResponse):
     one event has `is_final_response()` as True for each participating agent.
     """
     if self.actions.skip_summarization or self.long_running_tool_ids:
+      return True
+    if (
+        bool(self.error_code)
+        and not self.partial
+        and not self.get_function_calls()
+    ):
       return True
     return (
         not self.get_function_calls()
@@ -302,4 +315,4 @@ class Event(LlmResponse):
 
   @staticmethod
   def new_id() -> str:
-    return cast(str, platform_uuid.new_uuid())
+    return platform_uuid.new_uuid()

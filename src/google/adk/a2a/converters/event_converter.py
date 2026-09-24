@@ -15,9 +15,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import json
 import logging
 from typing import Any
-from typing import Dict
 from typing import List
 from typing import Optional
 
@@ -32,7 +32,7 @@ from google.genai import types as genai_types
 from .. import _compat
 from ...agents.invocation_context import InvocationContext
 from ...events.event import Event
-from ...flows.llm_flows.functions import REQUEST_EUC_FUNCTION_CALL_NAME
+from ...flows.llm_flows.tools._functions import REQUEST_EUC_FUNCTION_CALL_NAME
 from ..experimental import a2a_experimental
 from .part_converter import A2A_DATA_PART_METADATA_IS_LONG_RUNNING_KEY
 from .part_converter import A2A_DATA_PART_METADATA_TYPE_FUNCTION_CALL
@@ -80,7 +80,7 @@ Returns:
 """
 
 
-def _serialize_metadata_value(value: Any) -> str:
+def _serialize_metadata_value(value: object) -> object:
   """Safely serializes metadata values to string format.
 
   Args:
@@ -91,16 +91,24 @@ def _serialize_metadata_value(value: Any) -> str:
   """
   if hasattr(value, "model_dump"):
     try:
-      return value.model_dump(exclude_none=True, by_alias=True)
+      return value.model_dump(mode="json", exclude_none=True, by_alias=True)
     except Exception as e:
       logger.warning("Failed to serialize metadata value: %s", e)
       return str(value)
+
+  if isinstance(value, (dict, list)):
+    try:
+      return json.dumps(value)
+    except Exception as e:
+      logger.warning("Failed to serialize collection to JSON: %s", e)
+      return str(value)
+
   return str(value)
 
 
 def _get_context_metadata(
     event: Event, invocation_context: InvocationContext
-) -> Dict[str, str]:
+) -> dict[str, object]:
   """Gets the context metadata for the event.
 
   Args:
@@ -119,7 +127,7 @@ def _get_context_metadata(
     raise ValueError("Invocation context cannot be None")
 
   try:
-    metadata = {
+    metadata: dict[str, object] = {
         _get_adk_metadata_key("app_name"): invocation_context.app_name,
         _get_adk_metadata_key("user_id"): invocation_context.user_id,
         _get_adk_metadata_key("session_id"): invocation_context.session.id,
@@ -234,14 +242,32 @@ def convert_a2a_task_to_event(
     ):
       message = a2a_task.status.message
     elif a2a_task.history:
-      message = a2a_task.history[-1]
+      # Only pick agent-role messages from history; a trailing user
+      # message should not be misattributed as agent output.
+      agent_messages = [
+          m for m in a2a_task.history if m.role == _compat.ROLE_AGENT
+      ]
+      if agent_messages:
+        message = agent_messages[-1]
 
     # Convert message if available
     if message:
       try:
-        return convert_a2a_message_to_event(
+        event: Event = convert_a2a_message_to_event(
             message, author, invocation_context, part_converter=part_converter
         )
+        if (
+            getattr(a2a_task.status, "state", None)
+            in (
+                _compat.TS_COMPLETED,
+                _compat.TS_FAILED,
+                _compat.TS_CANCELED,
+            )
+            and event.content
+            and event.content.parts
+        ):
+          event.actions.skip_summarization = True
+        return event
       except Exception as e:
         logger.error("Failed to convert A2A task message to event: %s", e)
         raise RuntimeError(f"Failed to convert task message: {e}") from e
@@ -288,6 +314,8 @@ def convert_a2a_message_to_event(
   if a2a_message is None:
     raise ValueError("A2A message cannot be None")
 
+  genai_role = _compat.role_to_str(a2a_message.role)
+
   if not a2a_message.parts:
     logger.warning(
         "A2A message has no parts, creating event with empty content"
@@ -300,7 +328,7 @@ def convert_a2a_message_to_event(
         ),
         author=author or "a2a agent",
         branch=invocation_context.branch if invocation_context else None,
-        content=genai_types.Content(role="model", parts=[]),
+        content=genai_types.Content(role=genai_role, parts=[]),
     )
 
   try:
@@ -355,7 +383,7 @@ def convert_a2a_message_to_event(
         if long_running_tool_ids
         else None,
         content=genai_types.Content(
-            role="model",
+            role=genai_role,
             parts=output_parts,
         ),
     )
@@ -546,7 +574,7 @@ def convert_event_to_a2a_events(
   if not invocation_context:
     raise ValueError("Invocation context cannot be None")
 
-  a2a_events = []
+  a2a_events: List[A2AEvent] = []
 
   try:
     # Handle error scenarios

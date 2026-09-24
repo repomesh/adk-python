@@ -22,11 +22,15 @@ from fastapi.openapi.models import OAuth2
 from google.adk.a2a import _compat
 from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
 from google.adk.auth.auth_credential import AuthCredential
+from google.adk.auth.auth_credential import AuthCredentialTypes
 from google.adk.auth.auth_credential import OAuth2Auth
+from google.adk.integrations.agent_identity.gcp_auth_provider_scheme import GcpAuthProviderScheme
 from google.adk.integrations.agent_registry import AgentRegistry
 from google.adk.integrations.agent_registry.agent_registry import _ProtocolType
+from google.adk.integrations.agent_registry.agent_registry import _should_use_mtls_endpoint
 from google.adk.telemetry.tracing import GCP_MCP_SERVER_DESTINATION_ID
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
+from google.adk.utils._google_client_headers import merge_tracking_headers
 import httpx
 from mcp import ClientSession
 from mcp.types import ListToolsResult
@@ -60,6 +64,34 @@ def _assert_protocol_version(agent_card, expected):
       iface.protocol_version for iface in agent_card.supported_interfaces or []
   ]
   assert expected in versions
+
+
+def _agent_with_binding_side_effect(path, *_args, **_kwargs):
+  """Serves an A2A agent bound to an auth provider."""
+  if path == "test-agent":
+    return {
+        "displayName": "TestAgent",
+        "description": "Test Desc",
+        "version": "1.0",
+        "agentId": "urn:agent:pub:ns:agent-456",
+        "protocols": [{
+            "type": _ProtocolType.A2A_AGENT,
+            "interfaces": [{
+                "url": "https://my-agent.com",
+                "protocolBinding": "HTTP_JSON",
+            }],
+        }],
+    }
+  if path == "bindings":
+    return {
+        "bindings": [{
+            "target": {"identifier": "urn:agent:pub:ns:agent-456"},
+            "authProviderBinding": {
+                "authProvider": "projects/123/locations/l/authProviders/ap-789"
+            },
+        }]
+    }
+  return {}
 
 
 class TestAgentRegistry:
@@ -324,7 +356,7 @@ class TestAgentRegistry:
     assert agents == {"agents": [{"name": "agent-1"}]}
     registry._session.post.assert_called_once_with(
         f"{registry._base_url}/projects/test-project/locations/global/agents:search",
-        headers={"x-goog-user-project": "test-project"},
+        headers=merge_tracking_headers({"x-goog-user-project": "test-project"}),
         json={
             "searchString": "test-agent",
             "searchType": "KEYWORD",
@@ -358,7 +390,7 @@ class TestAgentRegistry:
     assert mcp_servers == {"mcpServers": [{"name": "mcp-1"}]}
     registry._session.post.assert_called_once_with(
         f"{registry._base_url}/projects/test-project/locations/global/mcpServers:search",
-        headers={"x-goog-user-project": "test-project"},
+        headers=merge_tracking_headers({"x-goog-user-project": "test-project"}),
         json={
             "searchString": "test-mcp",
             "searchType": "KEYWORD",
@@ -412,6 +444,7 @@ class TestAgentRegistry:
           ("https://mcp.com", False, False),
           ("https://mcp.googleapis.com/v1", True, False),
           ("https://example.com/googleapis/v1", False, False),
+          ("http://mcp.googleapis.com/v1", False, False),
           ("https://mcp.googleapis.com/v1", True, True),
       ],
   )
@@ -672,6 +705,25 @@ class TestAgentRegistry:
     assert headers["Authorization"] == "Bearer fake-token"
     assert "x-goog-user-project" not in headers
 
+  def test_registry_requests_identify_adk(self, registry):
+    """Registry calls carry the ADK client label.
+
+    Without it, server-side usage data cannot separate ADK traffic from any
+    other caller of the Agent Registry API.
+    """
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"mcpServers": []}
+    mock_response.raise_for_status = MagicMock()
+    registry._session.post.return_value = mock_response
+    registry._credentials.token = "token"
+    registry._credentials.refresh = MagicMock()
+
+    registry.search_mcp_servers(search_string="test")
+
+    headers = registry._session.post.call_args.kwargs["headers"]
+    assert "google-adk/" in headers["x-goog-api-client"]
+    assert "google-adk/" in headers["user-agent"]
+
   def test_make_request_raises_http_status_error(self, registry):
     mock_response = MagicMock()
     mock_response.status_code = 500
@@ -795,6 +847,113 @@ class TestAgentRegistry:
     )
     assert toolset._auth_scheme.continue_uri == "https://override.com/continue"
 
+  @patch.object(AgentRegistry, "_make_request")
+  def test_get_remote_a2a_agent_with_binding(self, mock_make_request, registry):
+    """The agent's auth provider binding becomes its auth scheme."""
+    mock_make_request.side_effect = _agent_with_binding_side_effect
+
+    agent = registry.get_remote_a2a_agent(
+        "test-agent", continue_uri="https://override.com/continue"
+    )
+
+    assert isinstance(agent, RemoteA2aAgent)
+    auth_scheme = agent._auth_config.auth_scheme
+    assert isinstance(auth_scheme, GcpAuthProviderScheme)
+    assert auth_scheme.name == "projects/123/locations/l/authProviders/ap-789"
+    assert auth_scheme.continue_uri == "https://override.com/continue"
+
+  @patch.object(AgentRegistry, "_make_request")
+  def test_get_remote_a2a_agent_with_card_and_binding(
+      self, mock_make_request, registry
+  ):
+    """The binding is resolved for agents that publish a full card too."""
+
+    def side_effect(path, *args, **kwargs):
+      if path == "test-agent":
+        return {
+            "agentId": "urn:agent:pub:ns:agent-456",
+            "card": {
+                "type": "A2A_AGENT_CARD",
+                "content": {
+                    "name": "CardName",
+                    "description": "CardDesc",
+                    "version": "2.0",
+                    "url": "https://card-agent.com",
+                    "capabilities": {},
+                    "defaultInputModes": ["text"],
+                    "defaultOutputModes": ["text"],
+                    "skills": [],
+                },
+            },
+        }
+      return _agent_with_binding_side_effect(path, *args, **kwargs)
+
+    mock_make_request.side_effect = side_effect
+
+    agent = registry.get_remote_a2a_agent("test-agent")
+
+    assert (
+        agent._auth_config.auth_scheme.name
+        == "projects/123/locations/l/authProviders/ap-789"
+    )
+
+  @patch.object(AgentRegistry, "_make_request")
+  def test_get_remote_a2a_agent_with_explicit_auth(
+      self, mock_make_request, registry
+  ):
+    """An explicit scheme is used as is and skips the binding lookup."""
+    mock_make_request.side_effect = _agent_with_binding_side_effect
+    auth_scheme = GcpAuthProviderScheme(name="explicit-provider")
+    auth_credential = AuthCredential(
+        auth_type=AuthCredentialTypes.API_KEY, api_key="key"
+    )
+
+    agent = registry.get_remote_a2a_agent(
+        "test-agent",
+        auth_scheme=auth_scheme,
+        auth_credential=auth_credential,
+    )
+
+    assert agent._auth_config.auth_scheme is auth_scheme
+    assert agent._auth_config.raw_auth_credential == auth_credential
+    assert "bindings" not in [
+        c.args[0] for c in mock_make_request.call_args_list
+    ]
+
+  @patch.object(AgentRegistry, "_make_request")
+  def test_get_remote_a2a_agent_without_binding(
+      self, mock_make_request, registry
+  ):
+    """An agent bound to no auth provider is left unauthenticated."""
+
+    def side_effect(path, *args, **kwargs):
+      if path == "bindings":
+        return {"bindings": []}
+      return _agent_with_binding_side_effect(path, *args, **kwargs)
+
+    mock_make_request.side_effect = side_effect
+
+    agent = registry.get_remote_a2a_agent("test-agent")
+
+    assert agent._auth_config is None
+
+  @patch.object(AgentRegistry, "_make_request")
+  def test_get_remote_a2a_agent_tolerates_bindings_failure(
+      self, mock_make_request, registry
+  ):
+    """A failed binding lookup does not fail agent construction."""
+
+    def side_effect(path, *args, **kwargs):
+      if path == "bindings":
+        raise RuntimeError("bindings unavailable")
+      return _agent_with_binding_side_effect(path, *args, **kwargs)
+
+    mock_make_request.side_effect = side_effect
+
+    agent = registry.get_remote_a2a_agent("test-agent")
+
+    assert agent._auth_config is None
+
 
 class TestAgentRegistryMtls:
 
@@ -888,24 +1047,22 @@ class TestAgentRegistryMtls:
         assert _use_client_cert_effective() == expected
 
   @pytest.mark.parametrize(
-      "use_mtls_env, client_cert_source, expected_domain",
+      "use_mtls_env, client_cert_source, expected",
       [
           # Auto mode (default)
-          (None, None, "agentregistry.googleapis.com"),
-          (None, lambda: True, "agentregistry.mtls.googleapis.com"),
+          (None, None, False),
+          (None, lambda: True, True),
           # Always mode
-          ("always", None, "agentregistry.mtls.googleapis.com"),
-          ("always", lambda: True, "agentregistry.mtls.googleapis.com"),
+          ("always", None, True),
+          ("always", lambda: True, True),
           # Never mode
-          ("never", None, "agentregistry.googleapis.com"),
-          ("never", lambda: True, "agentregistry.googleapis.com"),
+          ("never", None, False),
+          ("never", lambda: True, False),
       ],
   )
-  def test_get_agent_registry_base_url(
-      self, use_mtls_env, client_cert_source, expected_domain, registry
+  def test_should_use_mtls_endpoint(
+      self, use_mtls_env, client_cert_source, expected, registry
   ):
-    from google.adk.integrations.agent_registry.agent_registry import _get_agent_registry_base_url
-
     env_patch = {}
     if use_mtls_env is not None:
       env_patch["GOOGLE_API_USE_MTLS_ENDPOINT"] = use_mtls_env
@@ -913,8 +1070,29 @@ class TestAgentRegistryMtls:
       # Ensure any ambient env var doesn't leak into the test
       env_patch = {"GOOGLE_API_USE_MTLS_ENDPOINT": "auto"}
 
+    # Scenario 1: Library function does not exist (fallback path)
     with patch.dict(os.environ, env_patch):
-      assert expected_domain in _get_agent_registry_base_url(client_cert_source)
+      with patch(
+          "google.auth.transport.mtls.should_use_mtls_endpoint", create=True
+      ) as mock_func:
+        mock_func.side_effect = AttributeError("Mocked missing attribute")
+        assert expected == _should_use_mtls_endpoint(client_cert_source)
+
+    # Scenario 2: Library function exists (standard path)
+    def mock_impl(client_cert_available=None):
+      use_mtls = os.getenv("GOOGLE_API_USE_MTLS_ENDPOINT", "auto").lower()
+      if use_mtls == "always":
+        return True
+      if use_mtls == "never":
+        return False
+      return bool(client_cert_available)
+
+    with patch.dict(os.environ, env_patch):
+      with patch(
+          "google.auth.transport.mtls.should_use_mtls_endpoint", create=True
+      ) as mock_func:
+        mock_func.side_effect = mock_impl
+        assert expected == _should_use_mtls_endpoint(client_cert_source)
 
   def test_make_request_error_handling(self, registry):
     mock_session = registry._session

@@ -39,13 +39,16 @@ from google.adk.tools.mcp_tool.mcp_session_manager import SseConnectionParams
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from google.adk.tools.mcp_tool.mcp_session_manager import StreamableHTTPConnectionParams
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
+from google.adk.utils import _mtls_utils
+from google.adk.utils._google_client_headers import merge_tracking_headers
 import google.auth
 from google.auth.transport import mtls
 from google.auth.transport import requests as requests_auth
 import httpx
-from mcp import StdioServerParameters
 import requests
 from typing_extensions import override
+
+from ...dependencies._mcp import StdioServerParameters
 
 # pylint: disable=g-import-not-at-top
 try:
@@ -159,9 +162,9 @@ class Endpoint(TypedDict, total=False):
 
 
 def _is_google_api(url: str) -> bool:
-  """Checks if the given URL points to a Google API endpoint."""
+  """Checks if the given URL points to a Google API endpoint over https."""
   parsed_url = urlparse(url)
-  if not parsed_url.hostname:
+  if parsed_url.scheme != "https" or not parsed_url.hostname:
     return False
   return (
       parsed_url.hostname == "googleapis.com"
@@ -222,7 +225,12 @@ class AgentRegistry:
           else None
       )
       self._session.configure_mtls_channel(client_cert_source)
-    self._base_url = _get_agent_registry_base_url(client_cert_source)
+    self._use_mtls = _should_use_mtls_endpoint(client_cert_source)
+    self._base_url = (
+        AGENT_REGISTRY_MTLS_BASE_URL
+        if self._use_mtls
+        else AGENT_REGISTRY_BASE_URL
+    )
 
   def _get_auth_headers(self) -> Dict[str, str]:
     """Refreshes credentials and returns authorization headers."""
@@ -254,7 +262,7 @@ class AgentRegistry:
     quota_project_id = (
         getattr(self._credentials, "quota_project_id", None) or self.project_id
     )
-    headers = (
+    headers = merge_tracking_headers(
         {"x-goog-user-project": quota_project_id} if quota_project_id else {}
     )
     try:
@@ -325,9 +333,48 @@ class AgentRegistry:
         if protocol_binding and mapped_binding != protocol_binding:
           continue
         if url := i.get("url"):
+          if self._use_mtls:
+            url = _mtls_utils.effective_googleapis_endpoint(url)
           return url, protocol_version, mapped_binding
 
     return None, None, None
+
+  def _resolve_auth_provider_scheme(
+      self,
+      resource_id: str | None,
+      resource_name: str,
+      *,
+      continue_uri: str | None = None,
+  ) -> GcpAuthProviderScheme | None:
+    """Resolves the auth scheme a registered resource is bound to.
+
+    Args:
+      resource_id: The stable identifier of the resource (for example an
+        `agentId` or an `mcpServerId`), matched against the binding targets.
+      resource_name: The resource name, only used for logging.
+      continue_uri: Optional continue URI to override what is in the auth
+        provider.
+
+    Returns:
+      The scheme for the bound auth provider, or None if the resource is not
+      bound to one or the bindings could not be read.
+    """
+    if not resource_id:
+      return None
+    try:
+      bindings_data = self._make_request("bindings")
+      for b in bindings_data.get("bindings", []):
+        target_id = b.get("target", {}).get("identifier", "")
+        if not target_id.endswith(resource_id):
+          continue
+        auth_provider = b.get("authProviderBinding", {}).get("authProvider")
+        if auth_provider:
+          return GcpAuthProviderScheme(
+              name=auth_provider, continue_uri=continue_uri
+          )
+    except Exception as e:  # pylint: disable=broad-except
+      logger.warning("Failed to fetch bindings for %s: %s", resource_name, e)
+    return None
 
   def _clean_name(self, name: str) -> str:
     """Cleans a string to be a valid Python identifier for agent names."""
@@ -422,22 +469,10 @@ class AgentRegistry:
           f"MCP Server endpoint URI not found for: {mcp_server_name}"
       )
 
-    if mcp_server_id and not auth_scheme:
-      try:
-        bindings_data = self._make_request("bindings")
-        for b in bindings_data.get("bindings", []):
-          target_id = b.get("target", {}).get("identifier", "")
-          if target_id.endswith(mcp_server_id):
-            auth_provider = b.get("authProviderBinding", {}).get("authProvider")
-            if auth_provider:
-              auth_scheme = GcpAuthProviderScheme(
-                  name=auth_provider, continue_uri=continue_uri
-              )
-              break
-      except Exception as e:
-        logger.warning(
-            f"Failed to fetch bindings for MCP Server {mcp_server_name}: {e}"
-        )
+    if not auth_scheme:
+      auth_scheme = self._resolve_auth_provider_scheme(
+          mcp_server_id, mcp_server_name, continue_uri=continue_uri
+      )
 
     connection_params = StreamableHTTPConnectionParams(
         url=endpoint_uri,
@@ -560,11 +595,37 @@ class AgentRegistry:
   def get_remote_a2a_agent(
       self,
       agent_name: str,
+      auth_scheme: AuthScheme | None = None,
+      auth_credential: AuthCredential | None = None,
       *,
       httpx_client: httpx.AsyncClient | None = None,
+      continue_uri: str | None = None,
   ) -> RemoteA2aAgent:
-    """Creates a RemoteA2aAgent instance for a registered A2A Agent."""
+    """Creates a RemoteA2aAgent instance for a registered A2A Agent.
+
+    If `auth_scheme` is omitted, it is automatically resolved from the agent's
+    IAM bindings via `GcpAuthProviderScheme`.
+
+    Args:
+      agent_name: Resource name of the A2A Agent.
+      auth_scheme: Optional auth scheme. Resolved via bindings if omitted.
+      auth_credential: Optional auth credential.
+      httpx_client: Optional shared HTTP client.
+      continue_uri: Optional continue URI to override what is in the auth
+        provider.
+
+    Returns:
+      A RemoteA2aAgent for the registered agent.
+    """
     agent_info = self.get_agent_info(agent_name)
+
+    agent_id = agent_info.get("agentId")
+    if not isinstance(agent_id, str):
+      agent_id = None
+    if not auth_scheme:
+      auth_scheme = self._resolve_auth_provider_scheme(
+          agent_id, agent_name, continue_uri=continue_uri
+      )
 
     # Try to use the full agent card if available
     card = agent_info.get("card", {})
@@ -579,6 +640,8 @@ class AgentRegistry:
           agent_card=agent_card,
           description=agent_card.description,
           httpx_client=httpx_client,
+          auth_scheme=auth_scheme,
+          auth_credential=auth_credential,
       )
 
     name = self._clean_name(agent_info.get("displayName", agent_name))
@@ -621,6 +684,8 @@ class AgentRegistry:
         agent_card=agent_card,
         description=description,
         httpx_client=httpx_client,
+        auth_scheme=auth_scheme,
+        auth_credential=auth_credential,
     )
 
 
@@ -637,8 +702,16 @@ def _use_client_cert_effective() -> bool:
     return use_client_cert_str == "true"
 
 
-def _get_agent_registry_base_url(client_cert_source: Any | None = None) -> str:
-  """Returns the base URL based on mTLS configuration and cert availability."""
+def _should_use_mtls_endpoint(client_cert_source: Any | None = None) -> bool:
+  """Returns whether the mTLS endpoint should be used."""
+  try:
+    return bool(
+        mtls.should_use_mtls_endpoint(
+            client_cert_available=client_cert_source is not None
+        )
+    )
+  except (ImportError, AttributeError):
+    pass
   use_mtls_endpoint_str = os.getenv(
       "GOOGLE_API_USE_MTLS_ENDPOINT", _MtlsEndpoint.AUTO.value
   ).lower()
@@ -646,8 +719,6 @@ def _get_agent_registry_base_url(client_cert_source: Any | None = None) -> str:
     use_mtls_endpoint = _MtlsEndpoint(use_mtls_endpoint_str)
   except ValueError:
     use_mtls_endpoint = _MtlsEndpoint.AUTO
-  if (use_mtls_endpoint is _MtlsEndpoint.ALWAYS) or (
+  return (use_mtls_endpoint is _MtlsEndpoint.ALWAYS) or (
       use_mtls_endpoint is _MtlsEndpoint.AUTO and client_cert_source is not None
-  ):
-    return AGENT_REGISTRY_MTLS_BASE_URL
-  return AGENT_REGISTRY_BASE_URL
+  )

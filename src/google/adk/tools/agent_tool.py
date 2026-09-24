@@ -26,6 +26,7 @@ from pydantic import model_validator
 from typing_extensions import override
 
 from . import _automatic_function_calling_util
+from ..agents._streaming_mode import StreamingMode
 from ..agents.common_configs import AgentRefConfig
 from ..events._branch_path import _BranchPath
 from ..features import FeatureName
@@ -231,6 +232,8 @@ class AgentTool(BaseTool):
     input_schema = _get_input_schema(self.agent)
     if input_schema:
       input_value = input_schema.model_validate(args)
+      # The text must stay a bare JSON document: the node runtime re-validates
+      # it against this same schema, so any prose here fails that parse.
       content = types.Content(
           role='user',
           parts=[
@@ -285,17 +288,49 @@ class AgentTool(BaseTool):
         state=state_dict,
     )
 
+    # The wrapped agent runs as part of the caller's invocation, so it should
+    # obey the caller's run settings. Without this the nested run falls back to
+    # RunConfig's defaults, which means a max_llm_calls ceiling of 500 whatever
+    # the caller asked for and no custom_metadata, labels or HTTP options at
+    # all. The count itself is still per-invocation, so the ceiling bounds the
+    # nested run rather than being shared with the caller's.
+    nested_run_config = invocation_context.run_config
+    if nested_run_config is not None and nested_run_config.support_cfc:
+      # CFC describes how the caller's own model executes. Handing it to
+      # another agent replaces that agent's code executor and refuses to run it
+      # at all unless its model happens to be a Gemini 2 one.
+      nested_run_config = nested_run_config.model_copy(
+          update={'support_cfc': False}
+      )
+    if (
+        nested_run_config is not None
+        and nested_run_config.streaming_mode != StreamingMode.NONE
+    ):
+      # The nested run's events are not forwarded to the caller; only the last
+      # event's content becomes the response. That is complete in unary mode and
+      # in aggregated streaming, but a caller streaming without aggregation
+      # would leave only a partial chunk in the last event, so always run unary.
+      nested_run_config = nested_run_config.model_copy(
+          update={'streaming_mode': StreamingMode.NONE}
+      )
+
     last_content = None
+    last_error_message = None
     last_grounding_metadata = None
     async with Aclosing(
         runner.run_async(
-            user_id=session.user_id, session_id=session.id, new_message=content
+            user_id=session.user_id,
+            session_id=session.id,
+            new_message=content,
+            run_config=nested_run_config,
         )
     ) as agen:
       async for event in agen:
         # Forward state delta to parent session.
         if event.actions.state_delta:
           tool_context.state.update(event.actions.state_delta)
+        if event.error_message:
+          last_error_message = event.error_message
         if event.content:
           last_content = event.content
           last_grounding_metadata = event.grounding_metadata
@@ -305,9 +340,11 @@ class AgentTool(BaseTool):
     await runner.close()
 
     if last_content is None or last_content.parts is None:
-      return ''
+      return last_error_message or ''
     parts_text = (_part_to_text(p) for p in last_content.parts if not p.thought)
     merged_text = '\n'.join(t for t in parts_text if t)
+    if not merged_text and last_error_message:
+      return last_error_message
     output_schema = _get_output_schema(self.agent)
     if output_schema:
       tool_result = validate_schema(output_schema, merged_text)
@@ -367,6 +404,7 @@ class _SingleTurnAgentTool(AgentTool):
       tool_context: ToolContext,
   ) -> Any:
     input_schema = _get_input_schema(self.agent)
+    node_input: object
     if input_schema:
       try:
         node_input = input_schema.model_validate(args)

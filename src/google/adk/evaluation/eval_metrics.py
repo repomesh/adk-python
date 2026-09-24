@@ -25,6 +25,8 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import field_validator
+from pydantic import PrivateAttr
+from pydantic import SerializeAsAny
 from pydantic.json_schema import SkipJsonSchema
 from typing_extensions import TypeAlias
 
@@ -95,6 +97,7 @@ class JudgeModelOptions(EvalBaseModel):
 
   num_samples: int = Field(
       default=5,
+      ge=1,
       description=(
           "The number of times to sample the model for each invocation"
           " evaluation. Given that models tend to have certain degree of"
@@ -102,6 +105,14 @@ class JudgeModelOptions(EvalBaseModel):
           " data. These repeated invocation are them aggregated using some"
           " strategy. From experimentation, we have found 5 to be a good"
           " default."
+      ),
+  )
+
+  parallelism_limit: int = Field(
+      default=1,
+      ge=1,
+      description=(
+          "The maximum number of parallel LLM evaluation calls to execute."
       ),
   )
 
@@ -249,6 +260,13 @@ class ToolTrajectoryCriterion(BaseCriterion):
       ),
   )
 
+  ignore_args: bool = Field(
+      default=False,
+      description=(
+          "If True, only tool names are compared; arguments are ignored."
+      ),
+  )
+
   @field_validator("match_type", mode="before")
   @classmethod
   def _coerce_match_type(cls, value: object) -> object:
@@ -290,13 +308,29 @@ class EvalMetric(EvalBaseModel):
       ),
   )
 
-  criterion: Optional[BaseCriterion] = Field(
+  criterion: Optional[SerializeAsAny[BaseCriterion]] = Field(
       default=None, description="""Evaluation criterion used by the metric."""
   )
 
   custom_function_path: Optional[str] = Field(
       default=None,
       description="""Path to custom function, if this is a custom metric.""",
+  )
+
+  # The path declared for this metric in the eval config it was built from.
+  # Private, so that a metric parsed from an inbound payload cannot carry one:
+  # the public field above is settable by whoever built that payload.
+  _config_custom_function_path: Optional[str] = PrivateAttr(default=None)
+
+
+def _get_metric_threshold(eval_metric: EvalMetric) -> float:
+  """Returns the configured threshold or rejects an incomplete metric."""
+  if eval_metric.criterion is not None:
+    return eval_metric.criterion.threshold
+  if eval_metric.threshold is not None:
+    return eval_metric.threshold
+  raise ValueError(
+      f"Evaluation metric {eval_metric.metric_name!r} requires a threshold."
   )
 
 
@@ -388,7 +422,7 @@ class MetricInfo(EvalBaseModel):
 
   metric_name: str = Field(description="The name of the metric.")
 
-  description: str = Field(
+  description: Optional[str] = Field(
       default=None, description="A 2 to 3 line description of the metric."
   )
 

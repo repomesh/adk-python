@@ -17,7 +17,6 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING
 
-from ..utils._dependency import missing_extra
 from .base_memory_service import BaseMemoryService
 
 if TYPE_CHECKING:
@@ -39,7 +38,7 @@ _LAZY_MEMBERS: dict[str, str] = {
 }
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> object:
   if name in _LAZY_MEMBERS:
     module = importlib.import_module(f'{__name__}.{_LAZY_MEMBERS[name]}')
     return vars(module)[name]

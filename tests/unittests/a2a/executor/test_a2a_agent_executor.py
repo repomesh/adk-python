@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
 from unittest.mock import patch
@@ -21,17 +22,24 @@ from a2a.server.events import Event as A2AEvent
 from a2a.server.events.event_queue import EventQueue
 from a2a.types import Message
 from a2a.types import Task
+from a2a.types import TaskArtifactUpdateEvent
 from google.adk.a2a import _compat
 from google.adk.a2a.agent.interceptors.new_integration_extension import _NEW_A2A_ADK_INTEGRATION_EXTENSION
 from google.adk.a2a.converters.request_converter import AgentRunRequest
 from google.adk.a2a.executor.a2a_agent_executor import A2aAgentExecutor
 from google.adk.a2a.executor.a2a_agent_executor import A2aAgentExecutorConfig
 from google.adk.a2a.executor.config import ExecuteInterceptor
+from google.adk.agents.llm_agent import LlmAgent
 from google.adk.events.event import Event
 from google.adk.runners import RunConfig
 from google.adk.runners import Runner
+from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.genai import types
 from google.genai.types import Content
+from google.genai.types import Part
 import pytest
+
+from tests.unittests import testing_utils
 
 
 def _get_meta_val(metadata, key):
@@ -133,7 +141,7 @@ class TestA2aAgentExecutor:
         user_id="test-user",
         session_id="test-session",
         new_message=Mock(spec=Content),
-        run_config=Mock(spec=RunConfig),
+        run_config=RunConfig(),
     )
     # Mock session service
     mock_session = Mock()
@@ -212,10 +220,9 @@ class TestA2aAgentExecutor:
     # Verify final event was enqueued with proper message field
     final_event = self.mock_event_queue.enqueue_event.call_args_list[-1][0][0]
     _assert_final(final_event)
-    # The TaskResultAggregator is created with default state (working), and since no messages
-    # are processed, it will publish a status event with the current state
+    # No messages were processed, and the run still ends the task as completed.
     assert hasattr(final_event.status, "message")
-    assert final_event.status.state == _compat.TS_WORKING
+    assert final_event.status.state == _compat.TS_COMPLETED
 
   @pytest.mark.asyncio
   @pytest.mark.skipif(
@@ -235,7 +242,7 @@ class TestA2aAgentExecutor:
         user_id="test-user",
         session_id="test-session",
         new_message=Mock(spec=Content),
-        run_config=Mock(spec=RunConfig),
+        run_config=RunConfig(),
     )
     mock_session = Mock()
     mock_session.id = "test-session"
@@ -300,7 +307,7 @@ class TestA2aAgentExecutor:
         user_id="test-user",
         session_id="test-session",
         new_message=Mock(spec=Content),
-        run_config=Mock(spec=RunConfig),
+        run_config=RunConfig(),
     )
 
     # Mock session service
@@ -352,10 +359,9 @@ class TestA2aAgentExecutor:
     # Verify final event was enqueued with proper message field
     final_event = self.mock_event_queue.enqueue_event.call_args_list[-1][0][0]
     _assert_final(final_event)
-    # The TaskResultAggregator is created with default state (working), and since no messages
-    # are processed, it will publish a status event with the current state
+    # No messages were processed, and the run still ends the task as completed.
     assert hasattr(final_event.status, "message")
-    assert final_event.status.state == _compat.TS_WORKING
+    assert final_event.status.state == _compat.TS_COMPLETED
 
   @pytest.mark.asyncio
   async def test_prepare_session_new_session(self):
@@ -364,7 +370,7 @@ class TestA2aAgentExecutor:
         user_id="test-user",
         session_id=None,
         new_message=Mock(spec=Content),
-        run_config=Mock(spec=RunConfig),
+        run_config=RunConfig(),
     )
 
     # Mock session service
@@ -392,7 +398,7 @@ class TestA2aAgentExecutor:
         user_id="test-user",
         session_id="existing-session",
         new_message=Mock(spec=Content),
-        run_config=Mock(spec=RunConfig),
+        run_config=RunConfig(),
     )
 
     # Mock session service
@@ -536,7 +542,7 @@ class TestA2aAgentExecutor:
         user_id="test-user",
         session_id="test-session",
         new_message=Mock(spec=Content),
-        run_config=Mock(spec=RunConfig),
+        run_config=RunConfig(),
     )
 
     # Mock session service
@@ -577,10 +583,9 @@ class TestA2aAgentExecutor:
     # Verify final event was enqueued with proper message field
     final_event = self.mock_event_queue.enqueue_event.call_args_list[-1][0][0]
     _assert_final(final_event)
-    # The TaskResultAggregator is created with default state (working), and since no messages
-    # are processed, it will publish a status event with the current state
+    # No messages were processed, and the run still ends the task as completed.
     assert hasattr(final_event.status, "message")
-    assert final_event.status.state == _compat.TS_WORKING
+    assert final_event.status.state == _compat.TS_COMPLETED
 
   @pytest.mark.asyncio
   async def test_execute_with_async_callable_runner(self):
@@ -595,7 +600,7 @@ class TestA2aAgentExecutor:
         user_id="test-user",
         session_id="test-session",
         new_message=Mock(spec=Content),
-        run_config=Mock(spec=RunConfig),
+        run_config=RunConfig(),
     )
 
     # Mock session service
@@ -636,10 +641,9 @@ class TestA2aAgentExecutor:
     # Verify final event was enqueued with proper message field
     final_event = self.mock_event_queue.enqueue_event.call_args_list[-1][0][0]
     _assert_final(final_event)
-    # The TaskResultAggregator is created with default state (working), and since no messages
-    # are processed, it will publish a status event with the current state
+    # No messages were processed, and the run still ends the task as completed.
     assert hasattr(final_event.status, "message")
-    assert final_event.status.state == _compat.TS_WORKING
+    assert final_event.status.state == _compat.TS_COMPLETED
 
   @pytest.mark.asyncio
   async def test_handle_request_integration(self):
@@ -652,7 +656,7 @@ class TestA2aAgentExecutor:
         user_id="test-user",
         session_id="test-session",
         new_message=Mock(spec=Content),
-        run_config=Mock(spec=RunConfig),
+        run_config=RunConfig(),
     )
 
     # Mock session service
@@ -721,30 +725,51 @@ class TestA2aAgentExecutor:
           assert final_event.status.message.message_id == exp_msg.message_id
       else:
         assert final_event.status.message == mock_aggregator.task_status_message
-      # When aggregator state is working but no message, final event should be working
-      assert final_event.status.state == _compat.TS_WORKING
+      # When aggregator state is working but no message, the task still completes.
+      assert final_event.status.state == _compat.TS_COMPLETED
 
   @pytest.mark.asyncio
   async def test_cancel_with_task_id(self):
     """Test cancellation with a task ID."""
     self.mock_context.task_id = "test-task-id"
 
-    # The current implementation raises NotImplementedError
-    with pytest.raises(
-        NotImplementedError, match="Cancellation is not supported"
-    ):
-      await self.executor.cancel(self.mock_context, self.mock_event_queue)
+    await self.executor.cancel(self.mock_context, self.mock_event_queue)
+
+    self.mock_event_queue.enqueue_event.assert_awaited_once()
+    canceled_event = self.mock_event_queue.enqueue_event.await_args.args[0]
+    assert canceled_event.task_id == "test-task-id"
+    assert canceled_event.context_id == "test-context-id"
+    assert canceled_event.status.state == _compat.TS_CANCELED
+    _assert_final(canceled_event)
 
   @pytest.mark.asyncio
   async def test_cancel_without_task_id(self):
     """Test cancellation without a task ID."""
     self.mock_context.task_id = None
 
-    # The current implementation raises NotImplementedError regardless of task_id
-    with pytest.raises(
-        NotImplementedError, match="Cancellation is not supported"
-    ):
+    with pytest.raises(ValueError, match="must have a task ID"):
       await self.executor.cancel(self.mock_context, self.mock_event_queue)
+    self.mock_event_queue.enqueue_event.assert_not_awaited()
+
+  @pytest.mark.asyncio
+  async def test_execute_cancelled_does_not_publish_failure(self):
+    """Test that a cancelled execution is not reported as a failure."""
+    self.mock_context.task_id = "test-task-id"
+    self.mock_context.current_task = None
+
+    self.mock_request_converter.side_effect = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+      await self.executor.execute(self.mock_context, self.mock_event_queue)
+
+    # The cancellation must have been raised inside the guarded region.
+    self.mock_request_converter.assert_called_once()
+    states = [
+        call.args[0].status.state
+        for call in self.mock_event_queue.enqueue_event.call_args_list
+        if hasattr(call.args[0], "status")
+    ]
+    assert _compat.TS_FAILED not in states
 
   @pytest.mark.asyncio
   async def test_execute_with_exception_handling(self):
@@ -794,7 +819,7 @@ class TestA2aAgentExecutor:
         user_id="test-user",
         session_id="test-session",
         new_message=Mock(spec=Content),
-        run_config=Mock(spec=RunConfig),
+        run_config=RunConfig(),
     )
 
     # Mock session service
@@ -865,7 +890,7 @@ class TestA2aAgentExecutor:
         user_id="test-user",
         session_id="test-session",
         new_message=Mock(spec=Content),
-        run_config=Mock(spec=RunConfig),
+        run_config=RunConfig(),
     )
 
     # Mock session service
@@ -939,7 +964,7 @@ class TestA2aAgentExecutor:
         user_id="test-user",
         session_id="test-session",
         new_message=Mock(spec=Content),
-        run_config=Mock(spec=RunConfig),
+        run_config=RunConfig(),
     )
 
     # Mock session service
@@ -1027,7 +1052,7 @@ class TestA2aAgentExecutor:
         user_id="test-user",
         session_id="test-session",
         new_message=Mock(spec=Content),
-        run_config=Mock(spec=RunConfig),
+        run_config=RunConfig(),
     )
 
     # Mock session service
@@ -1104,7 +1129,7 @@ class TestA2aAgentExecutor:
         user_id="test-user",
         session_id="test-session",
         new_message=Mock(spec=Content),
-        run_config=Mock(spec=RunConfig),
+        run_config=RunConfig(),
     )
 
     # Setup Interceptor
@@ -1154,7 +1179,7 @@ class TestA2aAgentExecutor:
     )
     self.mock_runner._new_invocation_context.return_value = Mock()
 
-    # We patch TaskResultAggregator just to avoid other errors and simplfy
+    # We patch TaskResultAggregator just to avoid other errors and simplify
     with patch(
         "google.adk.a2a.executor.a2a_agent_executor.TaskResultAggregator"
     ) as mock_agg_class:
@@ -1210,7 +1235,7 @@ class TestA2aAgentExecutor:
         user_id="test-user",
         session_id="test-session",
         new_message=Mock(spec=Content),
-        run_config=Mock(spec=RunConfig),
+        run_config=RunConfig(),
     )
 
     # Mock session service
@@ -1279,3 +1304,175 @@ class TestA2aAgentExecutor:
           _get_meta_val(final_event.metadata, "adk_session_id")
           == "test-session"
       )
+
+  @pytest.mark.asyncio
+  async def test_a2a_agent_executor_task_mode_completion_contract(self) -> None:
+    """Test A2aAgentExecutor publishes completed state upon receiving finish_task event."""
+    # 1. Setup RequestContext mock.
+    context = Mock(spec=RequestContext)
+    context.task_id = "task-001"
+    context.context_id = "ctx-001"
+    context.current_task = None
+    context.call_context = None
+    context.metadata = None
+    context.requested_extensions = []
+    context.message = Message(
+        message_id="msg-001",
+        role=_compat.ROLE_USER,
+        parts=[_compat.make_text_part("run task")],
+    )
+
+    # 2. Setup Mock Runner that yields a realistic finish_task event.
+    mock_runner = Mock(spec=Runner)
+    mock_runner.app_name = "test-app"
+    mock_runner.session_service = Mock()
+    mock_session = Mock()
+    mock_session.id = "ctx-001"
+    mock_runner.session_service.get_session = AsyncMock(
+        return_value=mock_session
+    )
+
+    invocation_context = Mock()
+    invocation_context.app_name = "test-app"
+    invocation_context.user_id = "test-user"
+    invocation_context.session = Mock()
+    invocation_context.session.id = "ctx-001"
+    mock_runner._new_invocation_context.return_value = invocation_context
+
+    # Emulate the event generated by the runner when finish_task is called.
+    finish_task_part = Part.from_function_call(
+        name="finish_task", args={"result": "task completed successfully"}
+    )
+    finish_event = Event(
+        author="task_agent",
+        content=Content(parts=[finish_task_part]),
+        partial=False,
+    )
+    finish_event.output = finish_event.content
+
+    async def mock_run_async(**kwargs):
+      yield finish_event
+
+    mock_runner.run_async = mock_run_async
+
+    # 3. Create the A2aAgentExecutor wrapping the mock runner.
+    # We use a real executor config (no mocked converters/aggregators) to test
+    # integration.
+    executor = A2aAgentExecutor(runner=mock_runner)
+
+    event_queue = Mock(spec=EventQueue)
+    enqueued_events = []
+
+    async def mock_enqueue_event(event):
+      enqueued_events.append(event)
+
+    event_queue.enqueue_event = AsyncMock(side_effect=mock_enqueue_event)
+
+    # 4. Execute.
+    await executor.execute(context, event_queue)
+
+    # 5. Verify that the final status event is TS_COMPLETED.
+    final_events = _final_events(event_queue.enqueue_event.call_args_list)
+    assert len(final_events) >= 1
+    final_event = final_events[-1]
+    assert final_event.status.state == _compat.TS_COMPLETED
+
+    # 6. Verify the output artifact containing the finish_task call was
+    # enqueued.
+    artifact_events = [
+        e for e in enqueued_events if isinstance(e, TaskArtifactUpdateEvent)
+    ]
+    assert len(artifact_events) == 1
+    artifact_event = artifact_events[0]
+
+    assert len(artifact_event.artifact.parts) == 1
+    part = artifact_event.artifact.parts[0]
+    part_dict = (
+        _compat.data_part_dict(part)
+        if _compat.is_data_part(part)
+        else part.function_call
+    )
+    if isinstance(part_dict, dict):
+      assert part_dict["name"] == "finish_task"
+      assert part_dict["args"] == {"result": "task completed successfully"}
+    else:
+      assert part_dict.name == "finish_task"
+      assert part_dict.args == {"result": "task completed successfully"}
+
+  @pytest.mark.asyncio
+  async def test_a2a_agent_executor_real_runner_task_mode_integration(
+      self,
+  ) -> None:
+    """Test A2aAgentExecutor wraps a real Runner(mode='task') and resolves TS_COMPLETED."""
+    # 1. Setup RequestContext mock.
+    context = Mock(spec=RequestContext)
+    context.task_id = "task-002"
+    context.context_id = "ctx-002"
+    context.current_task = None
+    context.call_context = None
+    context.metadata = None
+    context.requested_extensions = []
+    context.message = Message(
+        message_id="msg-002",
+        role=_compat.ROLE_USER,
+        parts=[_compat.make_text_part("do the task")],
+    )
+
+    # 2. Setup real agent and runner
+    session_service = InMemorySessionService()
+    agent = LlmAgent(
+        name="task_agent",
+        model=testing_utils.MockModel.create(
+            responses=[
+                Part.from_function_call(
+                    name="finish_task",
+                    args={"result": "real integration success"},
+                )
+            ]
+        ),
+        mode="task",
+    )
+    runner = Runner(
+        app_name="test-app", agent=agent, session_service=session_service
+    )
+
+    # 3. Create the A2aAgentExecutor wrapping the real runner
+    executor = A2aAgentExecutor(runner=runner)
+
+    event_queue = Mock(spec=EventQueue)
+    enqueued_events = []
+
+    async def mock_enqueue_event(event):
+      enqueued_events.append(event)
+
+    event_queue.enqueue_event = AsyncMock(side_effect=mock_enqueue_event)
+
+    # 4. Execute
+    await executor.execute(context, event_queue)
+
+    # 5. Verify that the final status event is TS_COMPLETED.
+    final_events = _final_events(event_queue.enqueue_event.call_args_list)
+    assert len(final_events) >= 1
+    final_event = final_events[-1]
+    assert final_event.status.state == _compat.TS_COMPLETED
+
+    # 6. Verify the output artifact contains the finish_task call and is enqueued.
+    artifact_events = [
+        e for e in enqueued_events if isinstance(e, TaskArtifactUpdateEvent)
+    ]
+    assert len(artifact_events) == 1
+    artifact_event = artifact_events[0]
+
+    assert len(artifact_event.artifact.parts) == 1
+    part = artifact_event.artifact.parts[0]
+    part_dict = (
+        _compat.data_part_dict(part)
+        if _compat.is_data_part(part)
+        else part.function_call
+    )
+    if isinstance(part_dict, dict):
+      assert part_dict["name"] == "finish_task"
+      assert part_dict["response"] == {"result": "Task completed."}
+    else:
+      assert part_dict.name == "finish_task"
+      assert part_dict.response == {"result": "Task completed."}

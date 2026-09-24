@@ -15,11 +15,13 @@
 """Tests for GCP Skill Registry."""
 
 import io
+import logging
 import os
 from unittest import mock
 import zipfile
 
 from google.adk.integrations.skill_registry import gcp_skill_registry
+from google.adk.utils._google_client_headers import merge_tracking_headers
 import pytest
 
 
@@ -110,24 +112,28 @@ async def test_get_skill_success():
   assert skill.frontmatter.name == "my-skill"
   assert skill.frontmatter.description == "test"
   assert skill.instructions == "# My Skill"
+  assert skill._uri == (
+      "https://agentregistry.googleapis.com/v1alpha/projects/test-project/"
+      "locations/us-central1/skills/my-skill/revisions/rev-123"
+  )
 
   mock_get_called.assert_has_calls([
       mock.call(
           "https://agentregistry.googleapis.com/v1alpha/projects/test-project/locations/us-central1/skills/my-skill",
-          headers={
+          headers=merge_tracking_headers({
               "Authorization": "Bearer fake-token",
               "Content-Type": "application/json",
               "x-goog-user-project": "test-project",
-          },
+          }),
           params=None,
       ),
       mock.call(
           "https://agentregistry.googleapis.com/v1alpha/projects/test-project/locations/us-central1/skills/my-skill/revisions/rev-123",
-          headers={
+          headers=merge_tracking_headers({
               "Authorization": "Bearer fake-token",
               "Content-Type": "application/json",
               "x-goog-user-project": "test-project",
-          },
+          }),
           params={"alt": "media"},
       ),
   ])
@@ -170,13 +176,114 @@ async def test_search_skills_success():
 
   mock_get_called.assert_called_once_with(
       "https://agentregistry.googleapis.com/v1alpha/projects/test-project/locations/us-central1/skills:search",
-      headers={
+      headers=merge_tracking_headers({
           "Authorization": "Bearer fake-token",
           "Content-Type": "application/json",
           "x-goog-user-project": "test-project",
-      },
+      }),
       params={"search_string": "query"},
   )
+
+
+@pytest.mark.parametrize(
+    "bad_name, bad_description",
+    [
+        # A real first-party catalog entry: dots are outside the name pattern.
+        ("cloud.google.com-agent-platform-eval-flywheel", "Description bad"),
+        ("Skill-With-Caps", "Description bad"),
+        ("a" * 65, "Description bad"),
+        ("skill-no-description", ""),
+    ],
+)
+@pytest.mark.asyncio
+async def test_search_skills_skips_entry_failing_validation(
+    caplog, bad_name, bad_description
+):
+  """A catalog entry the client cannot represent must not sink the search.
+
+  The caller does not control what the catalog holds, so one entry that fails
+  frontmatter validation has to be skipped, leaving every valid hit returned.
+  Skipping loses data, so the warning is part of the contract: it is the only
+  signal the caller gets that a hit was dropped.
+  """
+  registry = gcp_skill_registry.GCPSkillRegistry()
+
+  mock_response = mock.MagicMock()
+  mock_response.status_code = 200
+  mock_response.json.return_value = {
+      "skills": [
+          {
+              "name": (
+                  f"projects/test-project/locations/us-central1/skills/{bad_name}"
+              ),
+              "description": bad_description,
+          },
+          {
+              "name": (
+                  "projects/test-project/locations/us-central1/skills/skill2"
+              ),
+              "description": "Description 2",
+          },
+      ]
+  }
+
+  with mock.patch("httpx.AsyncClient.get", return_value=mock_response):
+    with caplog.at_level(logging.WARNING, logger="google_adk"):
+      results = await registry.search_skills(query="query")
+
+  assert [r.name for r in results] == ["skill2"]
+  assert results[0].description == "Description 2"
+  assert len(caplog.records) == 1
+  assert bad_name in caplog.text
+
+
+@pytest.mark.parametrize("raw_name", [None, 7, ["a"]])
+@pytest.mark.asyncio
+async def test_search_skills_skips_entry_whose_name_is_not_a_string(
+    caplog, raw_name
+):
+  """A name that is not a string must take the same skip path.
+
+  `.split` on a non-string raises before validation is ever reached, which
+  would take down the whole call again -- the exact failure this skip removes.
+  """
+  registry = gcp_skill_registry.GCPSkillRegistry()
+
+  mock_response = mock.MagicMock()
+  mock_response.status_code = 200
+  mock_response.json.return_value = {
+      "skills": [
+          {"name": raw_name, "description": "Description 1"},
+          {
+              "name": (
+                  "projects/test-project/locations/us-central1/skills/skill2"
+              ),
+              "description": "Description 2",
+          },
+      ]
+  }
+
+  with mock.patch("httpx.AsyncClient.get", return_value=mock_response):
+    with caplog.at_level(logging.WARNING, logger="google_adk"):
+      results = await registry.search_skills(query="query")
+
+  assert [r.name for r in results] == ["skill2"]
+  assert len(caplog.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_registry_requests_identify_adk():
+  """Registry calls carry the ADK client label.
+
+  Without it, server-side usage data cannot separate ADK traffic from any
+  other caller of the Skill Registry API.
+  """
+  registry = gcp_skill_registry.GCPSkillRegistry()
+
+  headers = await registry._get_headers()
+
+  assert "google-adk/" in headers["x-goog-api-client"]
+  assert "google-adk/" in headers["user-agent"]
 
 
 @pytest.mark.asyncio
@@ -268,6 +375,69 @@ async def test_get_skill_raises_on_invalid_skill_name():
   with mock.patch("httpx.AsyncClient.get", side_effect=mock_get):
     with pytest.raises(ValueError, match="Invalid skill name in SKILL.md"):
       await registry.get_skill(name="my-skill")
+
+
+@pytest.mark.parametrize(
+    "unsafe_name",
+    [
+        "../../../projects/victim/locations/us-central1/skills/secret",
+        "my-skill/../other-skill",
+        "..%2f..%2fsecret",
+        "my-skill?alt=media",
+        "my-skill#fragment",
+        "my-skill/revisions/rev-123",
+        "My-Skill",
+        "",
+    ],
+)
+@pytest.mark.asyncio
+async def test_get_skill_rejects_unsafe_name_before_any_request(unsafe_name):
+  """Verifies that a name that is not a single safe path segment is rejected."""
+  registry = gcp_skill_registry.GCPSkillRegistry()
+
+  with mock.patch("httpx.AsyncClient.get") as mock_get_called:
+    with pytest.raises(ValueError, match="Invalid skill name"):
+      await registry.get_skill(name=unsafe_name)
+
+  mock_get_called.assert_not_called()
+
+
+@pytest.mark.parametrize("valid_name", ["my-skill", "my_skill", "skill2"])
+@pytest.mark.asyncio
+async def test_get_skill_builds_expected_url_for_valid_name(valid_name):
+  """Verifies that a valid name is still interpolated verbatim into the URL."""
+  registry = gcp_skill_registry.GCPSkillRegistry()
+
+  mock_response1 = mock.MagicMock()
+  mock_response1.status_code = 200
+  mock_response1.json.return_value = {
+      "name": (
+          f"projects/test-project/locations/us-central1/skills/{valid_name}"
+      ),
+      "defaultRevision": (
+          f"projects/test-project/locations/us-central1/skills/{valid_name}"
+          "/revisions/rev-123"
+      ),
+  }
+
+  mock_response2 = mock.MagicMock()
+  mock_response2.status_code = 200
+  mock_response2.content = _create_fake_zip_bytes()
+
+  async def mock_get(url, *unused_args, **kwargs):
+    if kwargs.get("params") and kwargs.get("params").get("alt") == "media":
+      return mock_response2
+    return mock_response1
+
+  with mock.patch(
+      "httpx.AsyncClient.get", side_effect=mock_get
+  ) as mock_get_called:
+    await registry.get_skill(name=valid_name)
+
+  assert mock_get_called.call_args_list[0].args[0] == (
+      "https://agentregistry.googleapis.com/v1alpha/projects/test-project/"
+      f"locations/us-central1/skills/{valid_name}"
+  )
 
 
 def test_constructor_configures_base_url():
@@ -401,10 +571,10 @@ async def test_use_custom_credentials():
 
   mock_get_called.assert_called_once_with(
       "https://agentregistry.googleapis.com/v1alpha/projects/test-project/locations/us-central1/skills:search",
-      headers={
+      headers=merge_tracking_headers({
           "Authorization": "Bearer custom-token",
           "Content-Type": "application/json",
           "x-goog-user-project": "custom-quota-project",
-      },
+      }),
       params={"search_string": "query"},
   )

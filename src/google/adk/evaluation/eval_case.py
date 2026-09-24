@@ -61,11 +61,19 @@ class InvocationEvent(EvalBaseModel):
   is intended for the Eval System.
   """
 
+  # The adk web eval editor serializes UI-only transcript indices
+  # (invocationIndex, toolUseIndex) onto each event. Those are not part of the
+  # persisted eval-case schema; ignore them so PUT /eval-cases does not 422.
+  model_config = pydantic.ConfigDict(extra="ignore")
+
   author: str
   """The name of the agent that authored/owned this event."""
 
-  content: Optional[genai_types.Content]
+  content: Optional[genai_types.Content] = None
   """The content of the event."""
+
+  grounding_metadata: Optional[genai_types.GroundingMetadata] = None
+  """Grounding metadata emitted with the event."""
 
 
 class InvocationEvents(EvalBaseModel):
@@ -123,6 +131,16 @@ class SessionInput(EvalBaseModel):
 
   user_id: str
   """The user id."""
+
+  session_id: Optional[str] = None
+  """A fixed session id to use for this eval case, if set.
+
+  Artifacts are keyed by (app_name, user_id, session_id), so a fixed session id
+  lets an eval case reach artifacts that were pre-loaded for that session. When
+  unset, a random session id is generated per case. An existing session under
+  this id is reused as-is, so `state` only applies when the session has to be
+  created.
+  """
 
   state: SessionState = Field(default_factory=dict)
   """The state of the session."""

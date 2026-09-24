@@ -20,14 +20,18 @@ import importlib
 from typing import Any
 from typing import TYPE_CHECKING
 
+from ._capabilities import LlmCapabilities
+from ._service_tier import ServiceTier
 from .base_llm import BaseLlm
 from .llm_request import LlmRequest
 from .llm_response import LlmResponse
 from .registry import LLMRegistry
 
 if TYPE_CHECKING:
-  from google.adk.labs.openai import OpenAILlm
+  from google.adk.integrations.oci._oci_genai_llm import OCIGenAILlm
+  from google.adk.integrations.openai import OpenAILlm
 
+  from ._fallback_model import FallbackModel
   from .anthropic_llm import AnthropicGenerateContentConfig
   from .anthropic_llm import Claude
   from .apigee_llm import ApigeeLlm
@@ -41,11 +45,14 @@ __all__ = [
     'ApigeeLlm',
     'BaseLlm',
     'Claude',
+    'FallbackModel',
     'Gemini',
     'Gemma',
     'Gemma3Ollama',
     'LLMRegistry',
     'LiteLlm',
+    'LlmCapabilities',
+    'ServiceTier',
 ]
 
 _LAZY_PROVIDERS: dict[str, tuple[list[str], str]] = {
@@ -63,12 +70,16 @@ _LAZY_PROVIDERS: dict[str, tuple[list[str], str]] = {
     ),
     # Gemma 3 only (function-calling workarounds). Gemma 4+ resolves to Gemini.
     'Gemma': ([r'gemma-.*'], 'gemma_llm'),
-    'ApigeeLlm': ([r'.*-apigee$'], 'apigee_llm'),
-    'Claude': ([r'claude-3-.*', r'claude-.*-4.*'], 'anthropic_llm'),
+    'ApigeeLlm': ([r'apigee\/.*'], 'apigee_llm'),
+    # Every Claude id belongs to this class, so match the family rather than
+    # its generations. Enumerating generations meant each new one was
+    # unusable until someone added a pattern, and the ids do not follow one
+    # order anyway: claude-opus-4 and claude-4-opus are both real.
+    'Claude': ([r'claude-.*'], 'anthropic_llm'),
     'Gemma3Ollama': ([r'ollama/gemma3.*'], 'gemma_llm'),
     'OpenAILlm': (
-        [r'gpt-.*', r'o1-.*', r'o3-.*'],
-        'google.adk.labs.openai',
+        [r'gpt-.*', r'o\d+-.*'],
+        'google.adk.integrations.openai._openai_llm',
     ),
     'LiteLlm': (
         [
@@ -91,6 +102,18 @@ _LAZY_PROVIDERS: dict[str, tuple[list[str], str]] = {
         ],
         'lite_llm',
     ),
+    'OCIGenAILlm': (
+        [
+            r'meta\.llama-.*',
+            r'google\.gemini-.*',
+            r'google\.gemma-.*',
+            r'xai\.grok-.*',
+            r'mistralai\.mistral-.*',
+            r'mistralai\.mixtral-.*',
+            r'nvidia\..*',
+        ],
+        'google.adk.integrations.oci._oci_genai_llm',
+    ),
 }
 
 for _name, (_patterns, _module) in _LAZY_PROVIDERS.items():
@@ -102,6 +125,7 @@ for _name, (_patterns, _module) in _LAZY_PROVIDERS.items():
 
 _OTHER_LAZY_IMPORTS: dict[str, str] = {
     'AnthropicGenerateContentConfig': 'anthropic_llm',
+    'FallbackModel': '_fallback_model',
 }
 
 

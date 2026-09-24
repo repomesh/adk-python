@@ -34,7 +34,7 @@ from pydantic import PrivateAttr
 from typing_extensions import override
 
 from ..events.event import Event
-from ..flows.llm_flows.interactions_processor import _find_previous_interaction_state
+from ..flows.llm_flows.context._interactions import _find_previous_interaction_state
 from ..models.interactions_utils import _build_mcp_server_param
 from ..models.interactions_utils import _convert_content_to_step
 from ..models.interactions_utils import _create_interactions
@@ -51,6 +51,8 @@ from ..utils._google_client_headers import merge_tracking_headers
 from ..utils.content_utils import to_user_content
 from ..utils.context_utils import Aclosing
 from ..utils.env_utils import is_enterprise_mode_enabled
+from ..utils.instructions_utils import inject_session_state
+from ..utils.instructions_utils import InstructionProvider
 from .base_agent import BaseAgent
 from .context import Context
 from .invocation_context import InvocationContext
@@ -144,6 +146,16 @@ class ManagedAgent(BaseAgent):
   agent_config: Optional[CreateAgentInteractionAgentConfigParam] = None
   """Runtime configuration passed to interactions.create."""
 
+  instruction: Union[str, InstructionProvider] = ''
+  """The system instruction sent to the Managed Agent.
+
+  A plain string may embed ``{var}``, ``{artifact.name}``, or ``{var?}``
+  placeholders that are resolved from session state / artifacts at request time
+  (see ``inject_session_state``). An ``InstructionProvider`` callable is invoked
+  with a ``ReadonlyContext`` and bypasses placeholder injection (it manages
+  state itself). Empty by default, in which case no system instruction is sent.
+  """
+
   tools: list[
       Union[types.Tool, BaseTool, Callable[..., Any], RemoteMcpServer]
   ] = Field(default_factory=list)
@@ -196,6 +208,29 @@ class ManagedAgent(BaseAgent):
             http_options=get_tracking_http_options(),
         )
     return self._api_client
+
+  async def canonical_instruction(
+      self, ctx: ReadonlyContext
+  ) -> tuple[str, bool]:
+    """Resolves ``self.instruction`` for the current context.
+
+    Mirrors ``LlmAgent.canonical_instruction``.
+
+    Args:
+      ctx: The read-only context used to resolve an InstructionProvider.
+
+    Returns:
+      A tuple of (instruction, bypass_state_injection).
+      ``bypass_state_injection``
+      is True when the instruction came from an ``InstructionProvider`` callable
+      (which manages state itself), False for a plain string.
+    """
+    if isinstance(self.instruction, str):
+      return self.instruction, False
+    instruction = self.instruction(ctx)
+    if inspect.isawaitable(instruction):
+      instruction = await instruction
+    return instruction, True
 
   async def _resolve_backend_tools(
       self, ctx: InvocationContext
@@ -341,8 +376,10 @@ class ManagedAgent(BaseAgent):
   async def _run_async_impl(
       self, ctx: InvocationContext
   ) -> AsyncGenerator[Event, None]:
-    # Lazy import: google.genai is heavy, so only `types` is imported at module
-    # level (see CheckGoogleGenaiLazyImport / base_llm_flow.run_live).
+    # Lazy import: google.genai is heavy, so `types` is the only name imported
+    # at module level via `from google.genai import ...`; every other such name
+    # is imported inside the function that needs it, as base_llm_flow.run_live
+    # does.
     from google.genai import errors
 
     # Recovery and tool resolution run outside the try so config errors (e.g.
@@ -359,6 +396,15 @@ class ManagedAgent(BaseAgent):
         _convert_content_to_step(ctx.user_content) if ctx.user_content else []
     )
     interaction_tools = await self._resolve_backend_tools(ctx)
+
+    raw_si, bypass_state_injection = await self.canonical_instruction(
+        ReadonlyContext(ctx)
+    )
+    system_instruction = raw_si
+    if not bypass_state_injection:
+      system_instruction = await inject_session_state(
+          raw_si, ReadonlyContext(ctx)
+      )
 
     create_kwargs: dict[str, Any] = {
         'agent': self.agent_id,
@@ -377,6 +423,8 @@ class ManagedAgent(BaseAgent):
       create_kwargs['agent_config'] = self.agent_config
     if prev_interaction_id:
       create_kwargs['previous_interaction_id'] = prev_interaction_id
+    if system_instruction:
+      create_kwargs['system_instruction'] = system_instruction
 
     # Request-time header merge, parity with google_llm.generate_content_async:
     # combine any RunConfig headers with ADK tracking headers, non-destructively.
@@ -402,7 +450,7 @@ class ManagedAgent(BaseAgent):
         build_interactions_request_log(
             model=self.agent_id,
             input_steps=input_steps,
-            system_instruction=None,
+            system_instruction=system_instruction or None,
             tools=interaction_tools if interaction_tools else None,
             generation_config=None,
             previous_interaction_id=prev_interaction_id,

@@ -30,7 +30,7 @@ class TaskResultAggregator:
 
   def __init__(self) -> None:
     self._task_state = _compat.TS_WORKING
-    self._task_status_message = None
+    self._task_status_message: Message | None = None
 
   def process_event(self, event: Event) -> None:
     """Process an event from the agent run and detect signals about the task status.
@@ -71,6 +71,14 @@ class TaskResultAggregator:
             event.status.message
         )
       event.status.state = _compat.TS_WORKING
+      # For backward compatibility with a2a v0.3 (a2a v1.0+ removes the `final`
+      # attribute from TaskStatusUpdateEvent). If we mutate the intermediate
+      # event to TS_WORKING, we must clear the final flag if present.
+      # Otherwise, the client runner will see final=True, terminate the stream
+      # prematurely, and miss the true final event (e.g. TS_FAILED) sent after
+      # the loop.
+      if hasattr(event, "final"):
+        event.final = False
 
   @property
   def task_state(self) -> Any:

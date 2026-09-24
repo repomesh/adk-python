@@ -14,8 +14,8 @@
 
 from __future__ import annotations
 
-from enum import Enum
 import logging
+import os
 import sys
 from typing import Any
 from typing import Optional
@@ -28,10 +28,28 @@ from pydantic import Field
 from pydantic import field_validator
 from pydantic import model_validator
 
+from ..models._service_tier import ServiceTier
 from ..sessions.base_session_service import GetSessionConfig
 from ..telemetry.context import TelemetryConfig
+from ._streaming_mode import StreamingMode
 
 logger = logging.getLogger('google_adk.' + __name__)
+
+_DEFAULT_MAX_LLM_CALLS = 500
+
+
+def _default_max_llm_calls() -> int:
+  """Resolves the default max LLM calls limit from environment or fallback."""
+  if env_val := os.getenv('ADK_MAX_LLM_CALLS'):
+    try:
+      return int(env_val)
+    except ValueError:
+      logger.warning(
+          'Invalid value for ADK_MAX_LLM_CALLS env var: %s. Using default %s.',
+          env_val,
+          _DEFAULT_MAX_LLM_CALLS,
+      )
+  return _DEFAULT_MAX_LLM_CALLS
 
 
 class ToolThreadPoolConfig(BaseModel):
@@ -52,136 +70,6 @@ class ToolThreadPoolConfig(BaseModel):
   )
 
 
-class StreamingMode(Enum):
-  """Streaming modes for agent execution.
-
-  This enum defines different streaming behaviors for how the agent returns
-  events as model response.
-  """
-
-  NONE = None
-  """Non-streaming mode (default).
-
-  In this mode:
-  - The runner returns one single content in a turn (one user / model
-    interaction).
-  - No partial/intermediate events are produced
-  - Suitable for: CLI tools, batch processing, synchronous workflows
-
-  Example:
-    ```python
-    config = RunConfig(streaming_mode=StreamingMode.NONE)
-    async for event in runner.run_async(..., run_config=config):
-      # event.partial is always False
-      # Only final responses are yielded
-      if event.content:
-        print(event.content.parts[0].text)
-    ```
-  """
-
-  SSE = 'sse'
-  """Server-Sent Events (SSE) streaming mode.
-
-  In this mode:
-  - The runner yields events progressively as the LLM generates responses
-  - Both partial events (streaming chunks) and aggregated events are yielded
-  - Suitable for: real-time display with typewriter effects in Web UIs, chat
-    applications, interactive displays
-
-  Event Types in SSE Mode:
-  - **Partial text events** (event.partial=True, contains text):
-    Streaming text chunks for typewriter effect. These should typically be
-    displayed to users in real-time.
-
-  - **Partial function call events** (event.partial=True, contains function_call):
-    Internal streaming chunks used to progressively build function call
-    arguments. These are typically NOT displayed to end users.
-
-  - **Aggregated events** (event.partial=False):
-    The complete, aggregated response after all streaming chunks. Contains
-    the full text or complete function call with all arguments.
-
-  Important Considerations:
-  1. **Duplicate text issue**: With Progressive SSE Streaming enabled
-     (default), you will receive both partial text chunks AND a final
-     aggregated text event. To avoid displaying text twice:
-     - Option A: Only display partial text events, skip final text events
-     - Option B: Only display final events, skip all partial events
-     - Option C: Track what's been displayed and skip duplicates
-
-  2. **Event filtering**: Applications should filter events based on their
-     needs. Common patterns:
-
-     # Pattern 1: Display only partial text + final function calls
-     async for event in runner.run_async(...):
-       if event.partial and event.content and event.content.parts:
-         # Check if it's text (not function call)
-         if any(part.text for part in event.content.parts):
-           if not any(part.function_call for part in event.content.parts):
-             # Display partial text for typewriter effect
-             text = ''.join(p.text or '' for p in event.content.parts)
-             print(text, end='', flush=True)
-       elif not event.partial and event.get_function_calls():
-         # Display final function calls
-         for fc in event.get_function_calls():
-           print(f"Calling {fc.name}({fc.args})")
-
-     # Pattern 2: Display only final events (no streaming effect)
-     async for event in runner.run_async(...):
-       if not event.partial:
-         # Only process final responses
-         if event.content:
-           text = ''.join(p.text or '' for p in event.content.parts)
-           print(text)
-
-  3. **Progressive SSE Streaming feature**: Controlled by the
-     ADK_ENABLE_PROGRESSIVE_SSE_STREAMING environment variable (default: ON).
-     - When ON: Preserves original part ordering, supports function call
-       argument streaming, produces partial events + final aggregated event
-     - When OFF: Simple text accumulation, may lose some information
-
-  Example:
-    ```python
-    config = RunConfig(streaming_mode=StreamingMode.SSE)
-    displayed_text = ""
-
-    async for event in runner.run_async(..., run_config=config):
-      if event.partial:
-        # Partial streaming event
-        if event.content and event.content.parts:
-          # Check if this is text (not a function call)
-          has_text = any(part.text for part in event.content.parts)
-          has_fc = any(part.function_call for part in event.content.parts)
-
-          if has_text and not has_fc:
-            # Display partial text chunks for typewriter effect
-            text = ''.join(p.text or '' for p in event.content.parts)
-            print(text, end='', flush=True)
-            displayed_text += text
-      else:
-        # Final event - check if we already displayed this content
-        if event.content:
-          final_text = ''.join(p.text or '' for p in event.content.parts)
-          if final_text != displayed_text:
-            # New content not yet displayed
-            print(final_text)
-    ```
-
-  See Also:
-  - Event.is_final_response() for identifying final responses
-  """
-
-  BIDI = 'bidi'
-  """Bidirectional streaming mode.
-
-  So far this mode is not used in the standard execution path. The actual
-  bidirectional streaming behavior via runner.run_live() uses a completely
-  different code path that doesn't rely on streaming_mode.
-
-  For bidirectional streaming, use runner.run_live() instead of run_async().
-  """
-
-
 class RunConfig(BaseModel):
   """Configs for runtime behavior of agents.
 
@@ -199,8 +87,33 @@ class RunConfig(BaseModel):
   http_options: Optional[types.HttpOptions] = None
   """HTTP options for the agent execution (e.g. custom headers)."""
 
+  labels: Optional[dict[str, str]] = None
+  """User labels for the current invocation (e.g. for billing/attribution)."""
+
+  service_tier: Optional[ServiceTier | str] = None
+  """Serving tier for the model calls of this run.
+
+  Reaches models that call the interactions API through `Gemini`, and nothing
+  else. A model on the generate_content path has no serving tier of its own
+  and ignores it. `ManagedAgent` ignores it too, despite being on the
+  interactions API: it calls `interactions.create` from its own execution
+  loop instead of going through a model, so it never reads this. Leave unset
+  to use the default tier.
+
+  A plain string is accepted alongside the enum, so a tier the backend adds
+  before ADK learns about it still works; unknown values are rejected by the
+  backend.
+
+  `ServiceTier.DEFERRED` queues each model call to run on off-peak capacity,
+  so it waits for room instead of being turned away when capacity is tight.
+  ADK waits for the queued result before yielding, which means the run takes
+  as long as the queue does, and an agent that calls tools queues once per
+  turn rather than once per run. It cannot be combined with
+  `StreamingMode.SSE`.
+  """
+
   response_modalities: Optional[list[types.Modality]] = None
-  """The output modalities. If not set, it's default to AUDIO."""
+  """The output modalities. If not set, it defaults to AUDIO."""
 
   avatar_config: Optional[types.AvatarConfig] = None
   """Avatar configuration for the live agent."""
@@ -277,7 +190,9 @@ class RunConfig(BaseModel):
 
   When set, tool executions will run in a separate thread pool executor
   instead of the main event loop. When None (default), tools run in the
-  main event loop.
+  main event loop. One pool serves every invocation running on the same event
+  loop and is shut down once that loop is gone, so its worker threads do not
+  outlive it.
 
   This helps keep the event loop responsive for:
   - User interruptions to be processed immediately
@@ -297,6 +212,10 @@ class RunConfig(BaseModel):
   Thread pool does NOT help with (GIL is held):
   - Pure Python CPU-bound code: loops, calculations, recursive algorithms
   - The GIL prevents true parallel execution for Python bytecode
+
+  Cancelling an invocation drops a tool call that has not started yet, but
+  Python cannot stop a thread that is already running, so a started call keeps
+  its worker thread until it returns.
 
   For CPU-intensive Python code, consider alternatives:
   - Use C extensions that release the GIL
@@ -328,9 +247,18 @@ class RunConfig(BaseModel):
       ),
   )
 
-  max_llm_calls: int = 500
+  max_llm_calls: int = Field(
+      default_factory=_default_max_llm_calls,
+      description=(
+          'A limit on the total number of llm calls for a given run. Can be'
+          ' overridden by ADK_MAX_LLM_CALLS environment variable.'
+      ),
+  )
   """
   A limit on the total number of llm calls for a given run.
+
+  This limit can be overridden by setting the `ADK_MAX_LLM_CALLS` environment
+  variable.
 
   Valid Values:
     - More than 0 and less than sys.maxsize: The bound on the number of llm
@@ -408,7 +336,7 @@ class RunConfig(BaseModel):
   @field_validator('max_llm_calls', mode='after')
   @classmethod
   def validate_max_llm_calls(cls, value: int) -> int:
-    if value == sys.maxsize:
+    if value >= sys.maxsize:
       raise ValueError(f'max_llm_calls should be less than {sys.maxsize}.')
     elif value <= 0:
       logger.warning(
@@ -420,3 +348,25 @@ class RunConfig(BaseModel):
       )
 
     return value
+
+  @model_validator(mode='after')
+  def validate_service_tier_streaming(self) -> RunConfig:
+    """Rejects a deferred run that also asks to stream.
+
+    A deferred create returns an interaction id as soon as the work is
+    accepted rather than a result, so there is nothing to stream. The
+    interactions transport refuses the combination too, but by then a caller
+    such as `/run_sse` has already opened its response; failing here lets the
+    caller reject the request up front instead.
+    """
+    if (
+        self.service_tier == ServiceTier.DEFERRED
+        and self.streaming_mode == StreamingMode.SSE
+    ):
+      raise ValueError(
+          "service_tier='deferred' cannot be used with StreamingMode.SSE. A"
+          ' deferred request is queued to run on off-peak capacity and returns'
+          ' an interaction id instead of a result, so there is nothing to'
+          ' stream.'
+      )
+    return self

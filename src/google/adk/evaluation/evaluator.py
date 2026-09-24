@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from abc import ABC
+from collections.abc import Awaitable
 from typing import ClassVar
 from typing import Optional
 
@@ -24,6 +25,21 @@ from .eval_case import Invocation
 from .eval_metrics import BaseCriterion
 from .eval_metrics import EvalStatus as EvalStatus
 from .eval_rubrics import RubricScore
+
+
+def _validate_invocation_lengths(
+    actual_invocations: list[Invocation],
+    expected_invocations: Optional[list[Invocation]],
+) -> None:
+  """Rejects invocation lists that cannot be paired without truncation."""
+  if expected_invocations is not None and len(actual_invocations) != len(
+      expected_invocations
+  ):
+    raise ValueError(
+        "actual_invocations and expected_invocations must have the same"
+        f" length; got {len(actual_invocations)} and"
+        f" {len(expected_invocations)}."
+    )
 
 
 class PerInvocationResult(BaseModel):
@@ -60,7 +76,7 @@ class Evaluator(ABC):
       actual_invocations: list[Invocation],
       expected_invocations: Optional[list[Invocation]] = None,
       conversation_scenario: Optional[ConversationScenario] = None,
-  ) -> EvaluationResult:
+  ) -> EvaluationResult | Awaitable[EvaluationResult]:
     """Returns EvaluationResult after performing evaluations using actual and expected invocations.
 
     Args:
