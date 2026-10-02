@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ from google.adk.agents.llm_agent import LlmAgent
 from google.adk.agents.run_config import RunConfig
 from google.adk.artifacts.base_artifact_service import ArtifactVersion
 from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
+from google.adk.auth.credential_service.in_memory_credential_service import InMemoryCredentialService
 from google.adk.cli import api_server as api_server_module
 from google.adk.cli import fast_api as fast_api_module
 from google.adk.cli.api_server import RunAgentRequest
@@ -53,6 +55,7 @@ from google.adk.plugins.bigquery_agent_analytics_plugin import BigQueryAgentAnal
 from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.sessions.session import Session
+from google.adk.sessions.vertex_ai_session_service import VertexAiSessionService
 from google.adk.tools.tool_confirmation import ToolConfirmation
 from google.api_core.exceptions import GoogleAPICallError
 from google.api_core.exceptions import InvalidArgument
@@ -781,6 +784,8 @@ def builder_test_client(
   """Return a TestClient rooted in a temporary agents directory."""
   with (
       patch.object(signal, "signal", autospec=True, return_value=None),
+      # Building the app adds tmp_path to sys.path; undo it for later tests.
+      patch.object(sys, "path", list(sys.path)),
       patch.object(
           fast_api_module,
           "create_session_service_from_options",
@@ -3570,6 +3575,92 @@ def test_a2a_in_memory_task_store_no_engine_dispose(
       pass
 
 
+def test_a2a_runner_factory_creates_isolated_runner(temp_agents_dir_with_a2a):  # pylint: disable=redefined-outer-name
+  """Verify the A2A runner factory creates a copy of the runner with in-memory services."""
+  # 1. Setup Mocks for the original runner and its services
+  original_runner = Runner(
+      agent=MagicMock(),
+      app_name="test_app",
+      session_service=VertexAiSessionService(),
+  )
+  original_runner.memory_service = MagicMock()
+  original_runner.artifact_service = MagicMock()
+  original_runner.credential_service = MagicMock()
+
+  # Mock the ApiServer to control the runner it returns
+  mock_web_server_instance = MagicMock()
+  mock_web_server_instance.get_runner_async = AsyncMock(
+      return_value=original_runner
+  )
+  # The factory captures the app_name, so we need to mock list_agents
+  mock_web_server_instance.list_agents.return_value = ["test_a2a_agent"]
+
+  # 2. Patch dependencies in the fast_api module
+  with (
+      patch(
+          "google.adk.cli.fast_api.ApiServer",
+          return_value=mock_web_server_instance,
+      ),
+      patch(
+          "google.adk.a2a.executor.a2a_agent_executor.A2aAgentExecutor"
+      ) as mock_executor,
+      patch("google.adk.a2a._compat.attach_a2a_routes_to_app"),
+  ):
+
+    # Change to temp directory
+    original_cwd = os.getcwd()
+    os.chdir(temp_agents_dir_with_a2a)
+    try:
+      # 3. Call get_fast_api_app to trigger the factory creation
+      get_fast_api_app(
+          agents_dir=".",
+          web=False,
+          session_service_uri="",
+          artifact_service_uri="",
+          memory_service_uri="",
+          allow_origins=[],
+          a2a=True,  # Enable A2A to create the factory
+          host="127.0.0.1",
+          port=8000,
+      )
+    finally:
+      os.chdir(original_cwd)
+
+    # 4. Capture the factory from the mocked A2aAgentExecutor
+    assert mock_executor.call_args is not None, "A2aAgentExecutor not called"
+    kwargs = mock_executor.call_args.kwargs
+    assert "runner" in kwargs
+    runner_factory = kwargs["runner"]
+
+    # 5. Execute the factory to get the new runner
+    # Since runner_factory is an async function, we need to run it.
+    # We run it in a separate thread to avoid event loop conflicts if
+    # an event loop is already running.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+      a2a_runner = executor.submit(asyncio.run, runner_factory()).result()
+
+    # 6. Assert that the new runner is a separate, modified copy
+    assert a2a_runner is not original_runner, "Runner should be a copy"
+
+    # Assert that services have been replaced with InMemory versions
+    assert isinstance(a2a_runner.memory_service, InMemoryMemoryService)
+    assert isinstance(a2a_runner.session_service, InMemorySessionService)
+    assert isinstance(a2a_runner.artifact_service, InMemoryArtifactService)
+    assert isinstance(a2a_runner.credential_service, InMemoryCredentialService)
+
+    # Assert that the original runner's services are unchanged
+    assert not isinstance(original_runner.memory_service, InMemoryMemoryService)
+    assert not isinstance(
+        original_runner.session_service, InMemorySessionService
+    )
+    assert not isinstance(
+        original_runner.artifact_service, InMemoryArtifactService
+    )
+    assert not isinstance(
+        original_runner.credential_service, InMemoryCredentialService
+    )
+
+
 def test_a2a_disabled_by_default(test_app):
   """Test that A2A functionality is disabled by default."""
   # The regular test_app fixture has a2a=False
@@ -3940,17 +4031,41 @@ def test_builder_save_rejects_external_schema_reference(builder_test_client):
   assert "input_schema" in response.json()["detail"]
 
 
+@pytest.mark.parametrize(
+    ("app_name", "reference"),
+    [
+        ("os", "os.system"),
+        ("sys", "sys.exit"),
+        ("google", "google.genai.Client"),
+        ("dotenv", "dotenv.cli.run_command"),
+    ],
+)
 def test_builder_save_rejects_reference_when_app_name_shadows_module(
-    builder_test_client,
+    builder_test_client, app_name, reference
 ):
   """An app named after a real module cannot vouch for its own references."""
   response = _save_builder_yaml(
       builder_test_client,
-      b"name: my_agent\ntools:\n  - name: os.system\n",
-      app_name="os",
+      f"name: my_agent\ntools:\n  - name: {reference}\n".encode(),
+      app_name=app_name,
   )
   assert response.status_code == 400
   assert "shadows" in response.json()["detail"]
+
+
+def test_builder_save_allows_reference_when_app_imports_from_its_directory(
+    builder_test_client, tmp_path, monkeypatch
+):
+  """An app that is importable passes when it imports from its own folder."""
+  (tmp_path / "importable_app").mkdir()
+  (tmp_path / "importable_app" / "__init__.py").touch()
+  monkeypatch.syspath_prepend(str(tmp_path))
+  response = _save_builder_yaml(
+      builder_test_client,
+      b"name: my_agent\ntools:\n  - name: importable_app.tools.search\n",
+      app_name="importable_app",
+  )
+  assert response.status_code == 200
 
 
 def test_builder_save_covers_every_code_config_field(builder_test_client):
@@ -5721,6 +5836,68 @@ def test_runtime_config_rejects_half_specified_logo(tmp_path):
   """--logo-text without --logo-image-url is a config error, not a silent drop."""
   with pytest.raises(ValueError, match="Both --logo-text and --logo-image-url"):
     get_fast_api_app(agents_dir=str(tmp_path), web=True, logo_text="ACME")
+
+
+@pytest.mark.parametrize(
+    ("url_prefix", "expected_root_path"),
+    [
+        (None, ""),
+        ("", ""),
+        ("adk", "/adk"),
+        ("adk/", "/adk"),
+        ("/adk", "/adk"),
+        ("/adk/", "/adk"),
+        ("host:8000/adk", "/host:8000/adk"),
+        ("https://host", ""),
+        ("https://host/", ""),
+        ("https://host/adk", "/adk"),
+        ("https://host/adk/", "/adk"),
+    ],
+)
+def test_url_prefix_propagated_to_fastapi_root_path(
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+    url_prefix: str | None,
+    expected_root_path: str,
+):
+  """FastAPI root_path is extracted from url_prefix."""
+  client = _create_test_client(
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      mock_eval_sets_manager,
+      mock_eval_set_results_manager,
+      url_prefix=url_prefix,
+  )
+  assert client.app.root_path == expected_root_path
+
+
+def test_url_prefix_propagated_to_docs_openapi_url(
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+):
+  """Swagger UI /docs references the prefix-qualified openapi.json."""
+  client = _create_test_client(
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      mock_eval_sets_manager,
+      mock_eval_set_results_manager,
+      url_prefix="/adk",
+  )
+  response = client.get("/docs")
+  assert response.status_code == 200
+  assert "/adk/openapi.json" in response.text
 
 
 if __name__ == "__main__":
