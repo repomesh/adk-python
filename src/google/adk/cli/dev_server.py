@@ -50,8 +50,10 @@ import anyio
 from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi import Request as FastAPIRequest
+from fastapi import Response
 from fastapi import UploadFile
 from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.responses import PlainTextResponse
 from fastapi.responses import StreamingResponse
 import graphviz
@@ -63,6 +65,7 @@ import yaml
 
 from . import agent_graph
 from ..apps.app import App
+from ..auth.auth_credential import _redact_credential_secrets
 from ..errors.not_found_error import NotFoundError
 from ..evaluation.base_eval_service import InferenceConfig
 from ..evaluation.base_eval_service import InferenceRequest
@@ -1111,6 +1114,7 @@ class DevServer(ApiServer):
     # TODO - remove after migration
     @app.get(
         "/dev/apps/{app_name}/eval_results/{eval_result_id}",
+        response_model=EvalSetResult,
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
     )
@@ -1121,10 +1125,17 @@ class DevServer(ApiServer):
     async def get_eval_result_legacy(
         app_name: str,
         eval_result_id: str,
-    ) -> EvalSetResult:
+    ) -> Response:
       try:
-        return self.eval_set_results_manager.get_eval_set_result(
+        eval_set_result = self.eval_set_results_manager.get_eval_set_result(
             app_name, eval_result_id
+        )
+        return JSONResponse(
+            content=_redact_credential_secrets(
+                eval_set_result.model_dump(
+                    exclude_none=True, by_alias=True, mode="json"
+                )
+            )
         )
       except ValueError as ve:
         raise HTTPException(status_code=404, detail=str(ve)) from ve
@@ -1226,24 +1237,32 @@ class DevServer(ApiServer):
 
     @app.get(
         "/dev/apps/{app_name}/eval-sets/{eval_set_id}/eval-cases/{eval_case_id}",
+        response_model=EvalCase,
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
     )
     @app.get(
         "/dev/apps/{app_name}/eval_sets/{eval_set_id}/evals/{eval_case_id}",
+        response_model=EvalCase,
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
     )
     async def get_eval(
         app_name: str, eval_set_id: str, eval_case_id: str
-    ) -> EvalCase:
+    ) -> Response:
       """Gets an eval case in an eval set."""
       eval_case_to_find = self.eval_sets_manager.get_eval_case(
           app_name, eval_set_id, eval_case_id
       )
 
       if eval_case_to_find:
-        return eval_case_to_find
+        return JSONResponse(
+            content=_redact_credential_secrets(
+                eval_case_to_find.model_dump(
+                    exclude_none=True, by_alias=True, mode="json"
+                )
+            )
+        )
 
       raise HTTPException(
           status_code=404,
@@ -1319,6 +1338,7 @@ class DevServer(ApiServer):
       # Create a mapping from eval set file to all the evals that needed to be
       # run.
       try:
+        from ..evaluation.eval_config import append_default_efficiency_metrics
         from ..evaluation.local_eval_service import LocalEvalService
         from ..evaluation.simulation.user_simulator_provider import UserSimulatorProvider
         from .cli_eval import _collect_eval_results
@@ -1377,10 +1397,15 @@ class DevServer(ApiServer):
             eval_service=eval_service,
         )
 
+        # The request carries only what the user selected in the run dialog,
+        # and the efficiency metrics are not selectable there: they take no
+        # threshold, so the dialog has nothing to ask about. Adding them here
+        # is what makes "reported for every eval" hold for a run started from
+        # the Dev UI, and not only for one started from `adk eval`.
         eval_case_results = await _collect_eval_results(
             inference_results=inference_results,
             eval_service=eval_service,
-            eval_metrics=req.eval_metrics,
+            eval_metrics=append_default_efficiency_metrics(req.eval_metrics),
         )
       except ModuleNotFoundError as e:
         logger.exception("%s", e)
@@ -1407,19 +1432,27 @@ class DevServer(ApiServer):
 
     @app.get(
         "/dev/apps/{app_name}/eval-results/{eval_result_id}",
+        response_model=EvalResult,
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
     )
     async def get_eval_result(
         app_name: str,
         eval_result_id: str,
-    ) -> EvalResult:
+    ) -> Response:
       """Gets the eval result for the given eval id."""
       try:
         eval_set_result = self.eval_set_results_manager.get_eval_set_result(
             app_name, eval_result_id
         )
-        return EvalResult(**eval_set_result.model_dump())
+        eval_result = EvalResult(**eval_set_result.model_dump())
+        return JSONResponse(
+            content=_redact_credential_secrets(
+                eval_result.model_dump(
+                    exclude_none=True, by_alias=True, mode="json"
+                )
+            )
+        )
       except ValueError as ve:
         raise HTTPException(status_code=404, detail=str(ve)) from ve
       except ValidationError as ve:
@@ -1449,27 +1482,15 @@ class DevServer(ApiServer):
 
         # Right now we ignore the app_name as eval metrics are not tied to the
         # app_name, but they could be moving forward.
-        # This endpoint feeds a surface that asks the user to pick metrics and
-        # set a threshold for each. Metrics that need no threshold are always
-        # on and have nothing for the user to choose, and they carry no value
-        # interval for a threshold control to bound itself by.
         #
-        # Hiding them is a compatibility shim for the Dev UI bundle vendored in
-        # cli/browser, which dereferences `metricValueInfo.interval`
-        # unconditionally while building the threshold form and so takes the
-        # whole form down on a metric that has none.
-        # TODO: Drop this filter once that
-        # bundle understands `requires_threshold=False` and renders those
-        # metrics as an always-on, non-selectable section instead. The bundle
-        # ships from this repo, so its refresh and this removal land together.
-        metrics_info = [
-            metric_info
-            for metric_info in (
-                DEFAULT_METRIC_EVALUATOR_REGISTRY.get_registered_metrics()
-            )
-            if metric_info.requires_threshold
-        ]
-        return ListMetricsInfoResponse(metrics_info=metrics_info)
+        # Every registered metric is listed, including the ones that need no
+        # threshold. A caller that asks the user to set thresholds decides for
+        # itself which to offer -- `MetricInfo.requires_threshold` says which
+        # those are -- while a caller that only describes metrics, such as the
+        # Dev UI's result tooltips, needs the whole list.
+        return ListMetricsInfoResponse(
+            metrics_info=DEFAULT_METRIC_EVALUATOR_REGISTRY.get_registered_metrics()
+        )
       except ModuleNotFoundError as e:
         logger.exception("%s\n%s", MISSING_EVAL_DEPENDENCIES_MESSAGE, e)
         raise HTTPException(

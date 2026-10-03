@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import asyncio
-import concurrent.futures
 import json
 import logging
 import os
@@ -35,7 +34,7 @@ from google.adk.agents.llm_agent import LlmAgent
 from google.adk.agents.run_config import RunConfig
 from google.adk.artifacts.base_artifact_service import ArtifactVersion
 from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
-from google.adk.auth.credential_service.in_memory_credential_service import InMemoryCredentialService
+from google.adk.auth.auth_credential import _redact_credential_secrets
 from google.adk.cli import api_server as api_server_module
 from google.adk.cli import fast_api as fast_api_module
 from google.adk.cli.api_server import RunAgentRequest
@@ -44,6 +43,9 @@ from google.adk.errors.input_validation_error import InputValidationError
 from google.adk.errors.session_not_found_error import SessionNotFoundError
 from google.adk.evaluation.eval_case import EvalCase
 from google.adk.evaluation.eval_case import Invocation
+from google.adk.evaluation.eval_case import SessionInput
+from google.adk.evaluation.eval_metrics import EvalStatus
+from google.adk.evaluation.eval_result import EvalCaseResult
 from google.adk.evaluation.eval_result import EvalSetResult
 from google.adk.evaluation.in_memory_eval_sets_manager import InMemoryEvalSetsManager
 from google.adk.events._internal_metadata import INTERNAL_METADATA_PREFIX
@@ -53,9 +55,9 @@ from google.adk.events.event_actions import EventActions
 from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
 from google.adk.plugins.bigquery_agent_analytics_plugin import BigQueryAgentAnalyticsPlugin
 from google.adk.runners import Runner
+from google.adk.sessions.base_session_service import ListSessionsResponse
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.sessions.session import Session
-from google.adk.sessions.vertex_ai_session_service import VertexAiSessionService
 from google.adk.tools.tool_confirmation import ToolConfirmation
 from google.api_core.exceptions import GoogleAPICallError
 from google.api_core.exceptions import InvalidArgument
@@ -749,6 +751,46 @@ def test_api_server_get_runner_async_rejects_internal_special_agent_name(
       "Access to internal special agents is disabled in API server mode"
       in exc_info.value.detail
   )
+
+
+@pytest.mark.parametrize(
+    ("web", "bind_host", "expected"),
+    [
+        (True, "127.0.0.1", True),
+        (True, "localhost", True),
+        (True, "::1", True),
+        (True, "0.0.0.0", False),
+        (True, "::", False),
+        (True, "192.168.1.10", False),
+        (True, None, False),
+        (False, "127.0.0.1", False),
+    ],
+)
+def test_special_agents_allowed_only_on_loopback_web_server(
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+    web,
+    bind_host,
+    expected,
+):
+  # The agent builder assistant writes files the server imports, and the dev
+  # server is unauthenticated, so it must not be reachable off the machine.
+  _create_test_client(
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      mock_eval_sets_manager,
+      mock_eval_set_results_manager,
+      web=web,
+      bind_host=bind_host,
+  )
+
+  assert mock_agent_loader._allow_special_agents is expected
 
 
 @pytest.fixture
@@ -1988,6 +2030,45 @@ def test_list_sessions(test_app, create_test_session):
   logger.info(f"Listed {len(data)} sessions")
 
 
+async def test_list_sessions_filters_eval_sessions(
+    test_app, test_session_info, mock_session_service
+):
+  """Test that eval sessions (both old and new prefixes) are filtered from list."""
+  # Create a normal session
+  await mock_session_service.create_session(
+      app_name=test_session_info["app_name"],
+      user_id=test_session_info["user_id"],
+      session_id="normal-session",
+      state={},
+  )
+  # Create a new style eval session
+  await mock_session_service.create_session(
+      app_name=test_session_info["app_name"],
+      user_id=test_session_info["user_id"],
+      session_id="adk-eval-session-new-style",
+      state={},
+  )
+  # Create an old style eval session
+  await mock_session_service.create_session(
+      app_name=test_session_info["app_name"],
+      user_id=test_session_info["user_id"],
+      session_id="___eval___session___old-style",
+      state={},
+  )
+
+  url = f"/apps/{test_session_info['app_name']}/users/{test_session_info['user_id']}/sessions"
+  response = test_app.get(url)
+
+  assert response.status_code == 200
+  data = response.json()
+  assert isinstance(data, list)
+
+  session_ids = [session["id"] for session in data]
+  assert "normal-session" in session_ids
+  assert "adk-eval-session-new-style" not in session_ids
+  assert "___eval___session___old-style" not in session_ids
+
+
 def test_delete_session(test_app, create_test_session):
   """Test deleting a session."""
   info = create_test_session
@@ -2424,6 +2505,1067 @@ def test_agent_run_sse_splits_artifact_delta(
   assert sse_events[1]["actions"]["artifactDelta"] == {"artifact.txt": 0}
 
 
+@pytest.fixture
+def oauth2_auth_config_dict():
+  return {
+      "authScheme": {
+          "type": "oauth2",
+          "flows": {
+              "authorizationCode": {
+                  "scopes": {"read": "read"},
+                  "authorizationUrl": "https://idp.example.com/oauth2/auth",
+                  "tokenUrl": "https://idp.example.com/oauth2/token",
+              }
+          },
+      },
+      "rawAuthCredential": {
+          "authType": "oauth2",
+          "oauth2": {
+              "clientId": "public-client-id",
+              "clientSecret": "should-never-reach-the-client",
+          },
+      },
+      "exchangedAuthCredential": {
+          "authType": "oauth2",
+          "oauth2": {
+              "clientId": "public-client-id",
+              "clientSecret": "should-never-reach-the-client",
+              "authUri": (
+                  "https://idp.example.com/oauth2/auth?client_id="
+                  "public-client-id&state=xyz"
+              ),
+              "state": "xyz",
+              "codeVerifier": "pkce-verifier-should-not-leak-either",
+          },
+      },
+      "credentialKey": "my_tool:oauth2:abcd1234",
+  }
+
+
+def test_agent_run_redacts_oauth2_client_secret(
+    test_app, create_test_session, monkeypatch, oauth2_auth_config_dict
+):
+  """/run must not leak OAuth2 secrets embedded in response payloads."""
+  info = create_test_session
+
+  async def run_async_with_auth_request(
+      self,
+      *,
+      user_id: str,
+      session_id: str,
+      invocation_id: Optional[str] = None,
+      new_message: Optional[types.Content] = None,
+      state_delta: Optional[dict[str, Any]] = None,
+      run_config: Optional[RunConfig] = None,
+  ):
+    del user_id, session_id, invocation_id, new_message, state_delta, run_config
+    yield Event(
+        author="agent",
+        invocation_id="invocation_id",
+        content=types.Content(
+            role="user",
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name="adk_request_credential",
+                        id="adk-req-cred-id",
+                        args={
+                            "functionCallId": "adk-original-fc-id",
+                            "authConfig": oauth2_auth_config_dict,
+                        },
+                    )
+                )
+            ],
+        ),
+        actions=EventActions(
+            requested_auth_configs={
+                "adk-original-fc-id": oauth2_auth_config_dict
+            }
+        ),
+    )
+
+  monkeypatch.setattr(Runner, "run_async", run_async_with_auth_request)
+
+  payload = {
+      "app_name": info["app_name"],
+      "user_id": info["user_id"],
+      "session_id": info["session_id"],
+      "new_message": {"role": "user", "parts": [{"text": "Hello agent"}]},
+  }
+
+  response = test_app.post("/run", json=payload)
+  assert response.status_code == 200
+  assert "should-never-reach-the-client" not in response.text
+  assert "pkce-verifier-should-not-leak-either" not in response.text
+
+  events = response.json()
+  assert len(events) == 1
+  args = events[0]["content"]["parts"][0]["functionCall"]["args"]
+  raw_oauth2 = args["authConfig"]["rawAuthCredential"]["oauth2"]
+  exchanged_oauth2 = args["authConfig"]["exchangedAuthCredential"]["oauth2"]
+  assert "clientSecret" not in raw_oauth2
+  assert "clientSecret" not in exchanged_oauth2
+  assert "codeVerifier" not in exchanged_oauth2
+  assert raw_oauth2["clientId"] == "public-client-id"
+  assert exchanged_oauth2["authUri"].startswith(
+      "https://idp.example.com/oauth2/auth"
+  )
+  assert args["authConfig"]["credentialKey"] == "my_tool:oauth2:abcd1234"
+
+  action_auth = events[0]["actions"]["requestedAuthConfigs"][
+      "adk-original-fc-id"
+  ]
+  assert "clientSecret" not in action_auth["rawAuthCredential"]["oauth2"]
+  assert "clientSecret" not in action_auth["exchangedAuthCredential"]["oauth2"]
+  assert "codeVerifier" not in action_auth["exchangedAuthCredential"]["oauth2"]
+  assert (
+      action_auth["rawAuthCredential"]["oauth2"]["clientId"]
+      == "public-client-id"
+  )
+
+
+def test_agent_run_sse_redacts_oauth2_client_secret(
+    test_app, create_test_session, monkeypatch, oauth2_auth_config_dict
+):
+  """/run_sse must not leak OAuth2 secrets embedded in a function call or actions.
+
+  When a tool needs OAuth, ADK attaches the credential -- including the
+  app's `client_secret` -- to an `adk_request_credential` function call's
+  `args` and the event's `actions.requested_auth_configs`. That `args` value is
+  an opaque dict, not a nested pydantic model, so it is not covered by
+  `Event.model_dump(exclude=...)`. This asserts the streamed event has the secret
+  fields stripped across both carriers while the fields the client actually
+  needs to complete the OAuth redirect (client_id, the authorization URL, the
+  credential key) are preserved.
+  """
+  info = create_test_session
+
+  async def run_async_with_auth_request(
+      self,
+      *,
+      user_id: str,
+      session_id: str,
+      invocation_id: Optional[str] = None,
+      new_message: Optional[types.Content] = None,
+      state_delta: Optional[dict[str, Any]] = None,
+      run_config: Optional[RunConfig] = None,
+  ):
+    del user_id, session_id, invocation_id, new_message, state_delta, run_config
+    yield Event(
+        author="agent",
+        invocation_id="invocation_id",
+        content=types.Content(
+            role="user",
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name="adk_request_credential",
+                        id="adk-req-cred-id",
+                        args={
+                            "functionCallId": "adk-original-fc-id",
+                            "authConfig": oauth2_auth_config_dict,
+                        },
+                    )
+                )
+            ],
+        ),
+        actions=EventActions(
+            requested_auth_configs={
+                "adk-original-fc-id": oauth2_auth_config_dict
+            }
+        ),
+    )
+
+  monkeypatch.setattr(Runner, "run_async", run_async_with_auth_request)
+
+  payload = {
+      "app_name": info["app_name"],
+      "user_id": info["user_id"],
+      "session_id": info["session_id"],
+      "new_message": {"role": "user", "parts": [{"text": "Hello agent"}]},
+      "streaming": True,
+  }
+
+  response = test_app.post("/run_sse", json=payload)
+  assert response.status_code == 200
+  assert "should-never-reach-the-client" not in response.text
+  assert "pkce-verifier-should-not-leak-either" not in response.text
+
+  sse_events = [
+      json.loads(line.removeprefix("data: "))
+      for line in response.text.splitlines()
+      if line.startswith("data: ")
+  ]
+  assert len(sse_events) == 1
+  args = sse_events[0]["content"]["parts"][0]["functionCall"]["args"]
+  raw_oauth2 = args["authConfig"]["rawAuthCredential"]["oauth2"]
+  exchanged_oauth2 = args["authConfig"]["exchangedAuthCredential"]["oauth2"]
+  assert "clientSecret" not in raw_oauth2
+  assert "clientSecret" not in exchanged_oauth2
+  assert "codeVerifier" not in exchanged_oauth2
+  # Fields the client actually needs to complete the OAuth redirect must
+  # survive the redaction.
+  assert raw_oauth2["clientId"] == "public-client-id"
+  assert exchanged_oauth2["authUri"].startswith(
+      "https://idp.example.com/oauth2/auth"
+  )
+  assert args["authConfig"]["credentialKey"] == "my_tool:oauth2:abcd1234"
+
+  # Event actions requestedAuthConfigs must also be redacted.
+  action_auth = sse_events[0]["actions"]["requestedAuthConfigs"][
+      "adk-original-fc-id"
+  ]
+  assert "clientSecret" not in action_auth["rawAuthCredential"]["oauth2"]
+  assert "clientSecret" not in action_auth["exchangedAuthCredential"]["oauth2"]
+  assert "codeVerifier" not in action_auth["exchangedAuthCredential"]["oauth2"]
+  assert (
+      action_auth["rawAuthCredential"]["oauth2"]["clientId"]
+      == "public-client-id"
+  )
+
+
+def test_agent_run_live_redacts_oauth2_client_secret(
+    test_app, create_test_session, monkeypatch, oauth2_auth_config_dict
+):
+  """/run_live websocket must not leak OAuth2 secrets in event frames."""
+  info = create_test_session
+
+  async def run_live_with_auth_request(
+      self,
+      *,
+      session,
+      live_request_queue,
+      run_config=None,
+  ):
+    del self, session, live_request_queue, run_config
+    yield Event(
+        author="agent",
+        invocation_id="invocation_id",
+        content=types.Content(
+            role="user",
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name="adk_request_credential",
+                        id="adk-req-cred-id",
+                        args={
+                            "functionCallId": "adk-original-fc-id",
+                            "authConfig": oauth2_auth_config_dict,
+                        },
+                    )
+                )
+            ],
+        ),
+        actions=EventActions(
+            requested_auth_configs={
+                "adk-original-fc-id": oauth2_auth_config_dict
+            }
+        ),
+    )
+
+  monkeypatch.setattr(Runner, "run_live", run_live_with_auth_request)
+
+  url = f"/run_live?app_name={info['app_name']}&user_id={info['user_id']}&session_id={info['session_id']}&modalities=AUDIO"
+
+  with test_app.websocket_connect(url) as ws:
+    text_data = ws.receive_text()
+    assert "should-never-reach-the-client" not in text_data
+    assert "pkce-verifier-should-not-leak-either" not in text_data
+
+    event_data = json.loads(text_data)
+    args = event_data["content"]["parts"][0]["functionCall"]["args"]
+    raw_oauth2 = args["authConfig"]["rawAuthCredential"]["oauth2"]
+    exchanged_oauth2 = args["authConfig"]["exchangedAuthCredential"]["oauth2"]
+    assert "clientSecret" not in raw_oauth2
+    assert "clientSecret" not in exchanged_oauth2
+    assert "codeVerifier" not in exchanged_oauth2
+    assert raw_oauth2["clientId"] == "public-client-id"
+    assert exchanged_oauth2["authUri"].startswith(
+        "https://idp.example.com/oauth2/auth"
+    )
+    assert args["authConfig"]["credentialKey"] == "my_tool:oauth2:abcd1234"
+
+    action_auth = event_data["actions"]["requestedAuthConfigs"][
+        "adk-original-fc-id"
+    ]
+    assert "clientSecret" not in action_auth["rawAuthCredential"]["oauth2"]
+    assert (
+        "clientSecret" not in action_auth["exchangedAuthCredential"]["oauth2"]
+    )
+    assert (
+        "codeVerifier" not in action_auth["exchangedAuthCredential"]["oauth2"]
+    )
+    assert (
+        action_auth["rawAuthCredential"]["oauth2"]["clientId"]
+        == "public-client-id"
+    )
+
+
+async def test_get_session_redacts_oauth2_client_secret(
+    test_app, test_session_info, mock_session_service, oauth2_auth_config_dict
+):
+  """GET /apps/{app_name}/users/{user_id}/sessions/{session_id} redacts secrets across all carriers."""
+  session = await mock_session_service.create_session(
+      app_name=test_session_info["app_name"],
+      user_id=test_session_info["user_id"],
+      session_id=test_session_info["session_id"],
+      state={
+          "oauth_cred_snake": {
+              "auth_type": "oauth2",
+              "oauth2": {
+                  "client_id": "public-client-id-snake",
+                  "client_secret": "snake-secret-should-never-reach-client",
+                  "access_token": "snake-token-should-never-reach-client",
+              },
+          }
+      },
+  )
+  event1 = Event(
+      author="agent",
+      invocation_id="invocation_id",
+      content=types.Content(
+          role="user",
+          parts=[
+              types.Part(
+                  function_call=types.FunctionCall(
+                      name="adk_request_credential",
+                      id="adk-req-cred-id",
+                      args={
+                          "functionCallId": "adk-original-fc-id",
+                          "authConfig": oauth2_auth_config_dict,
+                      },
+                  )
+              )
+          ],
+      ),
+      actions=EventActions(
+          requested_auth_configs={"adk-original-fc-id": oauth2_auth_config_dict}
+      ),
+  )
+  response_auth_config_dict = {
+      "authScheme": {
+          "type": "oauth2",
+          "flows": {
+              "authorizationCode": {
+                  "scopes": {"read": "read"},
+                  "authorizationUrl": "https://idp.example.com/oauth2/auth",
+                  "tokenUrl": "https://idp.example.com/oauth2/token",
+              }
+          },
+      },
+      "exchangedAuthCredential": {
+          "authType": "oauth2",
+          "oauth2": {
+              "clientId": "public-client-id",
+              "clientSecret": "should-never-reach-the-client",
+              "authResponseUri": (
+                  "https://idp.example.com/oauth2/callback?code=secret-auth-code"
+              ),
+          },
+      },
+  }
+  event2 = Event(
+      author="user",
+      invocation_id="invocation_id",
+      content=types.Content(
+          role="user",
+          parts=[
+              types.Part(
+                  function_response=types.FunctionResponse(
+                      name="adk_request_credential",
+                      id="adk-req-cred-id",
+                      response=response_auth_config_dict,
+                  )
+              )
+          ],
+      ),
+  )
+  await mock_session_service.append_event(session=session, event=event1)
+  await mock_session_service.append_event(session=session, event=event2)
+
+  url = (
+      f"/apps/{test_session_info['app_name']}/users/"
+      f"{test_session_info['user_id']}/sessions/{test_session_info['session_id']}"
+  )
+  response = test_app.get(url)
+  assert response.status_code == 200
+  assert "should-never-reach-the-client" not in response.text
+  assert "pkce-verifier-should-not-leak-either" not in response.text
+  assert "secret-auth-code" not in response.text
+  assert "snake-secret-should-never-reach-client" not in response.text
+  assert "snake-token-should-never-reach-client" not in response.text
+
+  data = response.json()
+  assert data["id"] == test_session_info["session_id"]
+  assert len(data["events"]) == 2
+
+  snake_oauth2 = data["state"]["oauth_cred_snake"]["oauth2"]
+  assert "client_secret" not in snake_oauth2
+  assert "access_token" not in snake_oauth2
+  assert snake_oauth2["client_id"] == "public-client-id-snake"
+
+  # Carrier 1: function call args.authConfig
+  args = data["events"][0]["content"]["parts"][0]["functionCall"]["args"]
+  raw_oauth2 = args["authConfig"]["rawAuthCredential"]["oauth2"]
+  exchanged_oauth2 = args["authConfig"]["exchangedAuthCredential"]["oauth2"]
+  assert "clientSecret" not in raw_oauth2
+  assert "clientSecret" not in exchanged_oauth2
+  assert "codeVerifier" not in exchanged_oauth2
+  assert raw_oauth2["clientId"] == "public-client-id"
+  assert exchanged_oauth2["authUri"].startswith(
+      "https://idp.example.com/oauth2/auth"
+  )
+  assert args["authConfig"]["credentialKey"] == "my_tool:oauth2:abcd1234"
+
+  # Carrier 2: actions requestedAuthConfigs
+  action_auth = data["events"][0]["actions"]["requestedAuthConfigs"][
+      "adk-original-fc-id"
+  ]
+  assert "clientSecret" not in action_auth["rawAuthCredential"]["oauth2"]
+  assert "clientSecret" not in action_auth["exchangedAuthCredential"]["oauth2"]
+  assert "codeVerifier" not in action_auth["exchangedAuthCredential"]["oauth2"]
+  assert (
+      action_auth["rawAuthCredential"]["oauth2"]["clientId"]
+      == "public-client-id"
+  )
+
+  # Carrier 3: function response response (authResponseUri)
+  resp = data["events"][1]["content"]["parts"][0]["functionResponse"][
+      "response"
+  ]
+  resp_oauth2 = resp["exchangedAuthCredential"]["oauth2"]
+  assert "clientSecret" not in resp_oauth2
+  assert "authResponseUri" not in resp_oauth2
+  assert resp_oauth2["clientId"] == "public-client-id"
+
+
+async def test_list_sessions_redacts_oauth2_client_secret(
+    test_app,
+    test_session_info,
+    mock_session_service,
+    monkeypatch,
+    oauth2_auth_config_dict,
+):
+  """GET /apps/{app_name}/users/{user_id}/sessions redacts secrets."""
+  event = Event(
+      author="agent",
+      invocation_id="invocation_id",
+      content=types.Content(
+          role="user",
+          parts=[
+              types.Part(
+                  function_call=types.FunctionCall(
+                      name="adk_request_credential",
+                      id="adk-req-cred-id",
+                      args={
+                          "functionCallId": "adk-original-fc-id",
+                          "authConfig": oauth2_auth_config_dict,
+                      },
+                  )
+              )
+          ],
+      ),
+      actions=EventActions(
+          requested_auth_configs={"adk-original-fc-id": oauth2_auth_config_dict}
+      ),
+  )
+  session = Session(
+      id=test_session_info["session_id"],
+      app_name=test_session_info["app_name"],
+      user_id=test_session_info["user_id"],
+      state={},
+      events=[event],
+  )
+  monkeypatch.setattr(
+      mock_session_service,
+      "list_sessions",
+      AsyncMock(return_value=ListSessionsResponse(sessions=[session])),
+  )
+
+  url = (
+      f"/apps/{test_session_info['app_name']}/users/"
+      f"{test_session_info['user_id']}/sessions"
+  )
+  response = test_app.get(url)
+  assert response.status_code == 200
+  assert "should-never-reach-the-client" not in response.text
+  assert "pkce-verifier-should-not-leak-either" not in response.text
+
+  data = response.json()
+  assert isinstance(data, list)
+  matching = [s for s in data if s["id"] == test_session_info["session_id"]]
+  assert len(matching) == 1
+  matched_session = matching[0]
+  assert len(matched_session["events"]) == 1
+  args = matched_session["events"][0]["content"]["parts"][0]["functionCall"][
+      "args"
+  ]
+  raw_oauth2 = args["authConfig"]["rawAuthCredential"]["oauth2"]
+  exchanged_oauth2 = args["authConfig"]["exchangedAuthCredential"]["oauth2"]
+  assert "clientSecret" not in raw_oauth2
+  assert "clientSecret" not in exchanged_oauth2
+  assert "codeVerifier" not in exchanged_oauth2
+  assert raw_oauth2["clientId"] == "public-client-id"
+  assert exchanged_oauth2["authUri"].startswith(
+      "https://idp.example.com/oauth2/auth"
+  )
+  assert args["authConfig"]["credentialKey"] == "my_tool:oauth2:abcd1234"
+  action_auth = matched_session["events"][0]["actions"]["requestedAuthConfigs"][
+      "adk-original-fc-id"
+  ]
+  assert "clientSecret" not in action_auth["rawAuthCredential"]["oauth2"]
+
+
+async def test_update_session_redacts_oauth2_client_secret(
+    test_app, test_session_info, mock_session_service, oauth2_auth_config_dict
+):
+  """PATCH /apps/{app_name}/users/{user_id}/sessions/{session_id} redacts secrets."""
+  session = await mock_session_service.create_session(
+      app_name=test_session_info["app_name"],
+      user_id=test_session_info["user_id"],
+      session_id=test_session_info["session_id"],
+      state={},
+  )
+  event = Event(
+      author="agent",
+      invocation_id="invocation_id",
+      content=types.Content(
+          role="user",
+          parts=[
+              types.Part(
+                  function_call=types.FunctionCall(
+                      name="adk_request_credential",
+                      id="adk-req-cred-id",
+                      args={
+                          "functionCallId": "adk-original-fc-id",
+                          "authConfig": oauth2_auth_config_dict,
+                      },
+                  )
+              )
+          ],
+      ),
+      actions=EventActions(
+          requested_auth_configs={"adk-original-fc-id": oauth2_auth_config_dict}
+      ),
+  )
+  await mock_session_service.append_event(session=session, event=event)
+
+  url = (
+      f"/apps/{test_session_info['app_name']}/users/"
+      f"{test_session_info['user_id']}/sessions/{test_session_info['session_id']}"
+  )
+  response = test_app.patch(url, json={"state_delta": {"key": "val"}})
+  assert response.status_code == 200
+  assert "should-never-reach-the-client" not in response.text
+  assert "pkce-verifier-should-not-leak-either" not in response.text
+
+  data = response.json()
+  assert data["id"] == test_session_info["session_id"]
+  assert len(data["events"]) >= 1
+  matching_events = [
+      e
+      for e in data["events"]
+      if e.get("content")
+      and e["content"].get("parts")
+      and e["content"]["parts"][0].get("functionCall", {}).get("name")
+      == "adk_request_credential"
+  ]
+  assert len(matching_events) == 1
+  args = matching_events[0]["content"]["parts"][0]["functionCall"]["args"]
+  raw_oauth2 = args["authConfig"]["rawAuthCredential"]["oauth2"]
+  exchanged_oauth2 = args["authConfig"]["exchangedAuthCredential"]["oauth2"]
+  assert "clientSecret" not in raw_oauth2
+  assert "clientSecret" not in exchanged_oauth2
+  assert "codeVerifier" not in exchanged_oauth2
+  assert raw_oauth2["clientId"] == "public-client-id"
+  assert exchanged_oauth2["authUri"].startswith(
+      "https://idp.example.com/oauth2/auth"
+  )
+  assert args["authConfig"]["credentialKey"] == "my_tool:oauth2:abcd1234"
+  action_auth = matching_events[0]["actions"]["requestedAuthConfigs"][
+      "adk-original-fc-id"
+  ]
+  assert "clientSecret" not in action_auth["rawAuthCredential"]["oauth2"]
+
+
+def test_get_eval_redacts_oauth2_client_secret(
+    test_app, test_session_info, mock_eval_sets_manager, oauth2_auth_config_dict
+):
+  """GET /dev/apps/{app_name}/eval-sets/{eval_set_id}/eval-cases/{eval_case_id} redacts secrets."""
+  event = Event(
+      author="agent",
+      invocation_id="invocation_id",
+      content=types.Content(
+          role="user",
+          parts=[
+              types.Part(
+                  function_call=types.FunctionCall(
+                      name="adk_request_credential",
+                      id="adk-req-cred-id",
+                      args={
+                          "functionCallId": "adk-original-fc-id",
+                          "authConfig": oauth2_auth_config_dict,
+                      },
+                  )
+              )
+          ],
+      ),
+      actions=EventActions(
+          requested_auth_configs={"adk-original-fc-id": oauth2_auth_config_dict}
+      ),
+  )
+  eval_case = EvalCase(
+      eval_id="test_eval_case_id",
+      conversation=[],
+      session_input=SessionInput(
+          app_name=test_session_info["app_name"],
+          user_id=test_session_info["user_id"],
+          events=[event],
+      ),
+  )
+  mock_eval_sets_manager.create_eval_set(
+      app_name=test_session_info["app_name"],
+      eval_set_id="test_eval_set_id",
+  )
+  mock_eval_sets_manager.add_eval_case(
+      app_name=test_session_info["app_name"],
+      eval_set_id="test_eval_set_id",
+      eval_case=eval_case,
+  )
+
+  url = f"/dev/apps/{test_session_info['app_name']}/eval-sets/test_eval_set_id/eval-cases/test_eval_case_id"
+  response = test_app.get(url)
+  assert response.status_code == 200
+  assert "should-never-reach-the-client" not in response.text
+  assert "pkce-verifier-should-not-leak-either" not in response.text
+
+  data = response.json()
+  assert data["evalId"] == "test_eval_case_id"
+  events = data["sessionInput"]["events"]
+  assert len(events) == 1
+  args = events[0]["content"]["parts"][0]["functionCall"]["args"]
+  raw_oauth2 = args["authConfig"]["rawAuthCredential"]["oauth2"]
+  exchanged_oauth2 = args["authConfig"]["exchangedAuthCredential"]["oauth2"]
+  assert "clientSecret" not in raw_oauth2
+  assert "clientSecret" not in exchanged_oauth2
+  assert "codeVerifier" not in exchanged_oauth2
+  assert raw_oauth2["clientId"] == "public-client-id"
+  assert exchanged_oauth2["authUri"].startswith(
+      "https://idp.example.com/oauth2/auth"
+  )
+  assert args["authConfig"]["credentialKey"] == "my_tool:oauth2:abcd1234"
+  action_auth = events[0]["actions"]["requestedAuthConfigs"][
+      "adk-original-fc-id"
+  ]
+  assert "clientSecret" not in action_auth["rawAuthCredential"]["oauth2"]
+
+
+def test_get_eval_result_redacts_oauth2_client_secret(
+    test_app,
+    test_session_info,
+    mock_eval_set_results_manager,
+    oauth2_auth_config_dict,
+):
+  """GET /dev/apps/{app_name}/eval-results/{eval_result_id} redacts secrets."""
+  event = Event(
+      author="agent",
+      invocation_id="invocation_id",
+      content=types.Content(
+          role="user",
+          parts=[
+              types.Part(
+                  function_call=types.FunctionCall(
+                      name="adk_request_credential",
+                      id="adk-req-cred-id",
+                      args={
+                          "functionCallId": "adk-original-fc-id",
+                          "authConfig": oauth2_auth_config_dict,
+                      },
+                  )
+              )
+          ],
+      ),
+      actions=EventActions(
+          requested_auth_configs={"adk-original-fc-id": oauth2_auth_config_dict}
+      ),
+  )
+  session = Session(
+      id=test_session_info["session_id"],
+      app_name=test_session_info["app_name"],
+      user_id=test_session_info["user_id"],
+      state={},
+      events=[event],
+  )
+  eval_case_result = EvalCaseResult(
+      eval_set_id="test_eval_set_id",
+      eval_id="test_eval_case_id",
+      final_eval_status=EvalStatus.PASSED,
+      overall_eval_metric_results=[],
+      eval_metric_result_per_invocation=[],
+      session_id=test_session_info["session_id"],
+      session_details=session,
+      user_id=test_session_info["user_id"],
+  )
+  mock_eval_set_results_manager.save_eval_set_result(
+      test_session_info["app_name"],
+      "test_eval_set_id",
+      [eval_case_result],
+  )
+
+  url = (
+      f"/dev/apps/{test_session_info['app_name']}/eval-results/"
+      f"{test_session_info['app_name']}_test_eval_set_id_eval_result"
+  )
+  response = test_app.get(url)
+  assert response.status_code == 200
+  assert "should-never-reach-the-client" not in response.text
+  assert "pkce-verifier-should-not-leak-either" not in response.text
+
+  data = response.json()
+  assert (
+      data["evalSetResultId"]
+      == f"{test_session_info['app_name']}_test_eval_set_id_eval_result"
+  )
+  assert len(data["evalCaseResults"]) == 1
+  case_result = data["evalCaseResults"][0]
+  events = case_result["sessionDetails"]["events"]
+  assert len(events) == 1
+  args = events[0]["content"]["parts"][0]["functionCall"]["args"]
+  raw_oauth2 = args["authConfig"]["rawAuthCredential"]["oauth2"]
+  exchanged_oauth2 = args["authConfig"]["exchangedAuthCredential"]["oauth2"]
+  assert "clientSecret" not in raw_oauth2
+  assert "clientSecret" not in exchanged_oauth2
+  assert "codeVerifier" not in exchanged_oauth2
+  assert raw_oauth2["clientId"] == "public-client-id"
+  assert exchanged_oauth2["authUri"].startswith(
+      "https://idp.example.com/oauth2/auth"
+  )
+  assert args["authConfig"]["credentialKey"] == "my_tool:oauth2:abcd1234"
+  action_auth = events[0]["actions"]["requestedAuthConfigs"][
+      "adk-original-fc-id"
+  ]
+  assert "clientSecret" not in action_auth["rawAuthCredential"]["oauth2"]
+
+
+def test_get_eval_result_legacy_redacts_oauth2_client_secret(
+    test_app,
+    test_session_info,
+    mock_eval_set_results_manager,
+    oauth2_auth_config_dict,
+):
+  """GET /dev/apps/{app_name}/eval_results/{eval_result_id} redacts secrets."""
+  event = Event(
+      author="agent",
+      invocation_id="invocation_id",
+      content=types.Content(
+          role="user",
+          parts=[
+              types.Part(
+                  function_call=types.FunctionCall(
+                      name="adk_request_credential",
+                      id="adk-req-cred-id",
+                      args={
+                          "functionCallId": "adk-original-fc-id",
+                          "authConfig": oauth2_auth_config_dict,
+                      },
+                  )
+              )
+          ],
+      ),
+      actions=EventActions(
+          requested_auth_configs={"adk-original-fc-id": oauth2_auth_config_dict}
+      ),
+  )
+  session = Session(
+      id=test_session_info["session_id"],
+      app_name=test_session_info["app_name"],
+      user_id=test_session_info["user_id"],
+      state={},
+      events=[event],
+  )
+  eval_case_result = EvalCaseResult(
+      eval_set_id="test_eval_set_id",
+      eval_id="test_eval_case_id",
+      final_eval_status=EvalStatus.PASSED,
+      overall_eval_metric_results=[],
+      eval_metric_result_per_invocation=[],
+      session_id=test_session_info["session_id"],
+      session_details=session,
+      user_id=test_session_info["user_id"],
+  )
+  mock_eval_set_results_manager.save_eval_set_result(
+      test_session_info["app_name"],
+      "test_eval_set_id",
+      [eval_case_result],
+  )
+
+  url = (
+      f"/dev/apps/{test_session_info['app_name']}/eval_results/"
+      f"{test_session_info['app_name']}_test_eval_set_id_eval_result"
+  )
+  response = test_app.get(url)
+  assert response.status_code == 200
+  assert "should-never-reach-the-client" not in response.text
+  assert "pkce-verifier-should-not-leak-either" not in response.text
+
+  data = response.json()
+  assert (
+      data["evalSetResultId"]
+      == f"{test_session_info['app_name']}_test_eval_set_id_eval_result"
+  )
+  assert len(data["evalCaseResults"]) == 1
+  case_result = data["evalCaseResults"][0]
+  events = case_result["sessionDetails"]["events"]
+  assert len(events) == 1
+  args = events[0]["content"]["parts"][0]["functionCall"]["args"]
+  raw_oauth2 = args["authConfig"]["rawAuthCredential"]["oauth2"]
+  exchanged_oauth2 = args["authConfig"]["exchangedAuthCredential"]["oauth2"]
+  assert "clientSecret" not in raw_oauth2
+  assert "clientSecret" not in exchanged_oauth2
+  assert "codeVerifier" not in exchanged_oauth2
+  assert raw_oauth2["clientId"] == "public-client-id"
+  assert exchanged_oauth2["authUri"].startswith(
+      "https://idp.example.com/oauth2/auth"
+  )
+  assert args["authConfig"]["credentialKey"] == "my_tool:oauth2:abcd1234"
+  action_auth = events[0]["actions"]["requestedAuthConfigs"][
+      "adk-original-fc-id"
+  ]
+  assert "clientSecret" not in action_auth["rawAuthCredential"]["oauth2"]
+
+
+def test_redaction_does_not_drop_non_auth_config_keys():
+  """Fields named token, password, apiKey outside authConfig must not be dropped."""
+  payload = {
+      "session_state": {
+          "apiKey": "my-api-key",
+          "token": "pagination-token",
+          "user_credential": {
+              "authType": "oauth2",
+              "oauth2": {
+                  "clientId": "cid-state",
+                  "accessToken": "secret-access-token",
+                  "refreshToken": "secret-refresh-token",
+                  "clientSecret": "drop-me-state",
+              },
+          },
+          "user_credential_snake": {
+              "auth_type": "oauth2",
+              "oauth2": {
+                  "client_id": "cid-state-snake",
+                  "access_token": "secret-access-token-snake",
+                  "refresh_token": "secret-refresh-token-snake",
+                  "client_secret": "drop-me-state-snake",
+              },
+          },
+      },
+      "actions": {
+          "stateDelta": {
+              "password": "secret-pw",
+              "auth_update": {
+                  "authType": "oauth2",
+                  "oauth2": {
+                      "accessToken": "secret-delta-at",
+                      "clientId": "cid-delta",
+                  },
+              },
+              "auth_update_snake": {
+                  "auth_type": "oauth2",
+                  "oauth2": {
+                      "access_token": "secret-delta-at-snake",
+                      "client_id": "cid-delta-snake",
+                  },
+              },
+          },
+          "requestedAuthConfigs": {
+              "fc-1": {
+                  "rawAuthCredential": {
+                      "oauth2": {
+                          "clientId": "cid-action",
+                          "clientSecret": "drop-me-action",
+                      }
+                  }
+              },
+              "fc-snake": {
+                  "raw_auth_credential": {
+                      "oauth2": {
+                          "client_id": "cid-action-snake",
+                          "client_secret": "drop-me-action-snake",
+                      }
+                  }
+              },
+          },
+      },
+      "events": [{
+          "content": {
+              "parts": [
+                  {
+                      "functionCall": {
+                          "name": "custom_search",
+                          "args": {"apiKey": "key123", "token": "tok456"},
+                      }
+                  },
+                  {
+                      "functionResponse": {
+                          "name": "custom_search",
+                          "response": {"token": "next_page_token"},
+                      }
+                  },
+                  {
+                      "functionCall": {
+                          "name": "adk_request_credential",
+                          "args": {
+                              "functionCallId": "fc-1",
+                              "authConfig": {
+                                  "rawAuthCredential": {
+                                      "oauth2": {
+                                          "clientId": "cid",
+                                          "clientSecret": "drop-me",
+                                      }
+                                  }
+                              },
+                          },
+                      }
+                  },
+                  {
+                      "functionResponse": {
+                          "name": "adk_request_credential",
+                          "response": {
+                              "exchangedAuthCredential": {
+                                  "oauth2": {
+                                      "clientId": "cid-resp",
+                                      "authResponseUri": (
+                                          "https://idp.example.com/cb?code=secret_code"
+                                      ),
+                                      "clientSecret": "drop-me-resp",
+                                  }
+                              }
+                          },
+                      }
+                  },
+                  {
+                      "functionCall": {
+                          "name": "adk_request_credential",
+                          "args": {
+                              "functionCallId": "fc-snake",
+                              "auth_config": {
+                                  "raw_auth_credential": {
+                                      "oauth2": {
+                                          "client_id": "cid-snake",
+                                          "client_secret": "drop-me-snake",
+                                      }
+                                  }
+                              },
+                          },
+                      }
+                  },
+                  {
+                      "functionResponse": {
+                          "name": "adk_request_credential",
+                          "response": {
+                              "exchanged_auth_credential": {
+                                  "oauth2": {
+                                      "client_id": "cid-resp-snake",
+                                      "auth_response_uri": (
+                                          "https://idp.example.com/cb?code=secret_code_snake"
+                                      ),
+                                      "client_secret": "drop-me-resp-snake",
+                                  }
+                              }
+                          },
+                      }
+                  },
+              ]
+          }
+      }],
+  }
+  redacted = _redact_credential_secrets(payload)
+  assert redacted["session_state"]["apiKey"] == "my-api-key"
+  assert redacted["session_state"]["token"] == "pagination-token"
+  assert (
+      "accessToken"
+      not in redacted["session_state"]["user_credential"]["oauth2"]
+  )
+  assert (
+      "refreshToken"
+      not in redacted["session_state"]["user_credential"]["oauth2"]
+  )
+  assert (
+      "clientSecret"
+      not in redacted["session_state"]["user_credential"]["oauth2"]
+  )
+  assert (
+      redacted["session_state"]["user_credential"]["oauth2"]["clientId"]
+      == "cid-state"
+  )
+  assert (
+      "access_token"
+      not in redacted["session_state"]["user_credential_snake"]["oauth2"]
+  )
+  assert (
+      "refresh_token"
+      not in redacted["session_state"]["user_credential_snake"]["oauth2"]
+  )
+  assert (
+      "client_secret"
+      not in redacted["session_state"]["user_credential_snake"]["oauth2"]
+  )
+  assert (
+      redacted["session_state"]["user_credential_snake"]["oauth2"]["client_id"]
+      == "cid-state-snake"
+  )
+  assert redacted["actions"]["stateDelta"]["password"] == "secret-pw"
+  assert (
+      "accessToken"
+      not in redacted["actions"]["stateDelta"]["auth_update"]["oauth2"]
+  )
+  assert (
+      redacted["actions"]["stateDelta"]["auth_update"]["oauth2"]["clientId"]
+      == "cid-delta"
+  )
+  assert (
+      "access_token"
+      not in redacted["actions"]["stateDelta"]["auth_update_snake"]["oauth2"]
+  )
+  assert (
+      redacted["actions"]["stateDelta"]["auth_update_snake"]["oauth2"][
+          "client_id"
+      ]
+      == "cid-delta-snake"
+  )
+  assert redacted["actions"]["requestedAuthConfigs"]["fc-1"][
+      "rawAuthCredential"
+  ]["oauth2"] == {"clientId": "cid-action"}
+  assert redacted["actions"]["requestedAuthConfigs"]["fc-snake"][
+      "raw_auth_credential"
+  ]["oauth2"] == {"client_id": "cid-action-snake"}
+  assert redacted["events"][0]["content"]["parts"][0]["functionCall"][
+      "args"
+  ] == {
+      "apiKey": "key123",
+      "token": "tok456",
+  }
+  assert redacted["events"][0]["content"]["parts"][1]["functionResponse"][
+      "response"
+  ] == {"token": "next_page_token"}
+  fc2 = redacted["events"][0]["content"]["parts"][2]["functionCall"]
+  assert fc2["args"]["authConfig"]["rawAuthCredential"]["oauth2"] == {
+      "clientId": "cid"
+  }
+  fr2 = redacted["events"][0]["content"]["parts"][3]["functionResponse"]
+  assert fr2["response"]["exchangedAuthCredential"]["oauth2"] == {
+      "clientId": "cid-resp"
+  }
+  fc_snake = redacted["events"][0]["content"]["parts"][4]["functionCall"]
+  assert fc_snake["args"]["auth_config"]["raw_auth_credential"]["oauth2"] == {
+      "client_id": "cid-snake"
+  }
+  fr_snake = redacted["events"][0]["content"]["parts"][5]["functionResponse"]
+  assert fr_snake["response"]["exchanged_auth_credential"]["oauth2"] == {
+      "client_id": "cid-resp-snake"
+  }
+
+
 def test_agent_run_sse_does_not_split_artifact_delta_for_function_resume(
     test_app, create_test_session, monkeypatch
 ):
@@ -2826,6 +3968,7 @@ async def test_agent_run_sse_consumer_exception_surfaces_error_event(
   def _failing_model_dump_json(*args, **kwargs):
     raise ValueError("Simulated JSON serialization error in consumer")
 
+  monkeypatch.setattr(Event, "model_dump", _failing_model_dump_json)
   monkeypatch.setattr(Event, "model_dump_json", _failing_model_dump_json)
 
   response = await handler(req)
@@ -3174,30 +4317,32 @@ def test_list_metrics_info(builder_test_client):
     assert "metricValueInfo" in metric
 
 
-def test_list_metrics_info_omits_metrics_that_need_no_threshold(
+def test_list_metrics_info_includes_metrics_that_need_no_threshold(
     builder_test_client,
 ):
-  """Always-on informational metrics are not offered for threshold selection.
+  """Informational metrics are listed too, flagged as needing no threshold.
 
-  This surface asks the user to pick metrics and set a threshold for each, and
-  bounds the threshold control by the metric's value interval. Metrics that
-  need no threshold have neither, so listing them leaves consumers with nothing
-  to render.
+  A caller that asks the user to pick metrics and set a threshold for each
+  filters on `requiresThreshold`; a caller that only describes metrics, such
+  as the Dev UI's result tooltips, needs every registered metric present.
   """
   response = builder_test_client.get("/dev/apps/test_app/metrics-info")
 
   assert response.status_code == 200
-  listed = [metric["metricName"] for metric in response.json()["metricsInfo"]]
-  assert "tool_trajectory_avg_score" in listed
+  by_name = {
+      metric["metricName"]: metric for metric in response.json()["metricsInfo"]
+  }
+  assert by_name["tool_trajectory_avg_score"]["requiresThreshold"] is True
   for informational in (
       "tool_call_count_v1",
       "inference_call_count_v1",
       "token_usage_v1",
+      "invocation_duration_v1",
   ):
-    assert informational not in listed
-  # Everything that is listed can be rendered as a bounded threshold control.
-  for metric in response.json()["metricsInfo"]:
-    assert metric["metricValueInfo"]["interval"]
+    assert by_name[informational]["requiresThreshold"] is False
+    # Nothing bounds an informational value, so a threshold control has no
+    # interval to size itself by. That is why the caller filters instead.
+    assert "interval" not in by_name[informational]["metricValueInfo"]
 
 
 def test_debug_trace(test_app):
@@ -3573,92 +4718,6 @@ def test_a2a_in_memory_task_store_no_engine_dispose(
     # Lifespan should complete without errors even with no engine.
     with TestClient(app):
       pass
-
-
-def test_a2a_runner_factory_creates_isolated_runner(temp_agents_dir_with_a2a):  # pylint: disable=redefined-outer-name
-  """Verify the A2A runner factory creates a copy of the runner with in-memory services."""
-  # 1. Setup Mocks for the original runner and its services
-  original_runner = Runner(
-      agent=MagicMock(),
-      app_name="test_app",
-      session_service=VertexAiSessionService(),
-  )
-  original_runner.memory_service = MagicMock()
-  original_runner.artifact_service = MagicMock()
-  original_runner.credential_service = MagicMock()
-
-  # Mock the ApiServer to control the runner it returns
-  mock_web_server_instance = MagicMock()
-  mock_web_server_instance.get_runner_async = AsyncMock(
-      return_value=original_runner
-  )
-  # The factory captures the app_name, so we need to mock list_agents
-  mock_web_server_instance.list_agents.return_value = ["test_a2a_agent"]
-
-  # 2. Patch dependencies in the fast_api module
-  with (
-      patch(
-          "google.adk.cli.fast_api.ApiServer",
-          return_value=mock_web_server_instance,
-      ),
-      patch(
-          "google.adk.a2a.executor.a2a_agent_executor.A2aAgentExecutor"
-      ) as mock_executor,
-      patch("google.adk.a2a._compat.attach_a2a_routes_to_app"),
-  ):
-
-    # Change to temp directory
-    original_cwd = os.getcwd()
-    os.chdir(temp_agents_dir_with_a2a)
-    try:
-      # 3. Call get_fast_api_app to trigger the factory creation
-      get_fast_api_app(
-          agents_dir=".",
-          web=False,
-          session_service_uri="",
-          artifact_service_uri="",
-          memory_service_uri="",
-          allow_origins=[],
-          a2a=True,  # Enable A2A to create the factory
-          host="127.0.0.1",
-          port=8000,
-      )
-    finally:
-      os.chdir(original_cwd)
-
-    # 4. Capture the factory from the mocked A2aAgentExecutor
-    assert mock_executor.call_args is not None, "A2aAgentExecutor not called"
-    kwargs = mock_executor.call_args.kwargs
-    assert "runner" in kwargs
-    runner_factory = kwargs["runner"]
-
-    # 5. Execute the factory to get the new runner
-    # Since runner_factory is an async function, we need to run it.
-    # We run it in a separate thread to avoid event loop conflicts if
-    # an event loop is already running.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-      a2a_runner = executor.submit(asyncio.run, runner_factory()).result()
-
-    # 6. Assert that the new runner is a separate, modified copy
-    assert a2a_runner is not original_runner, "Runner should be a copy"
-
-    # Assert that services have been replaced with InMemory versions
-    assert isinstance(a2a_runner.memory_service, InMemoryMemoryService)
-    assert isinstance(a2a_runner.session_service, InMemorySessionService)
-    assert isinstance(a2a_runner.artifact_service, InMemoryArtifactService)
-    assert isinstance(a2a_runner.credential_service, InMemoryCredentialService)
-
-    # Assert that the original runner's services are unchanged
-    assert not isinstance(original_runner.memory_service, InMemoryMemoryService)
-    assert not isinstance(
-        original_runner.session_service, InMemorySessionService
-    )
-    assert not isinstance(
-        original_runner.artifact_service, InMemoryArtifactService
-    )
-    assert not isinstance(
-        original_runner.credential_service, InMemoryCredentialService
-    )
 
 
 def test_a2a_disabled_by_default(test_app):
