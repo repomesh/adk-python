@@ -27,18 +27,22 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 from urllib.parse import quote
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from google.adk.a2a import _compat
 from google.adk.agents.base_agent import BaseAgent
 from google.adk.agents.llm_agent import LlmAgent
 from google.adk.agents.run_config import RunConfig
+from google.adk.apps.app import App
 from google.adk.artifacts.base_artifact_service import ArtifactVersion
 from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
 from google.adk.auth.auth_credential import _redact_credential_secrets
 from google.adk.cli import api_server as api_server_module
 from google.adk.cli import fast_api as fast_api_module
+from google.adk.cli import service_registry as service_registry_module
 from google.adk.cli.api_server import RunAgentRequest
 from google.adk.cli.fast_api import get_fast_api_app
+from google.adk.cli.utils.base_agent_loader import _AgentLoadError
 from google.adk.errors.input_validation_error import InputValidationError
 from google.adk.errors.session_not_found_error import SessionNotFoundError
 from google.adk.evaluation.eval_case import EvalCase
@@ -53,6 +57,7 @@ from google.adk.events._internal_metadata import RESTORED_EVENT_KEY
 from google.adk.events.event import Event
 from google.adk.events.event_actions import EventActions
 from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
+from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.plugins.bigquery_agent_analytics_plugin import BigQueryAgentAnalyticsPlugin
 from google.adk.runners import Runner
 from google.adk.sessions.base_session_service import ListSessionsResponse
@@ -65,6 +70,7 @@ from google.genai import types
 from pydantic import BaseModel
 import pytest
 from starlette.applications import Starlette
+import starlette.requests
 from starlette.routing import Mount
 
 # Configure logging to help diagnose server startup issues
@@ -766,7 +772,6 @@ def test_api_server_get_runner_async_rejects_internal_special_agent_name(
     mock_eval_sets_manager,
     mock_eval_set_results_manager,
 ):
-  from fastapi import HTTPException
   from google.adk.cli.api_server import ApiServer
 
   special_app_name = "__adk_agent_builder_assistant"
@@ -820,7 +825,7 @@ def test_special_agents_allowed_only_on_loopback_web_server(
 ):
   # The agent builder assistant writes files the server imports, and the dev
   # server is unauthenticated, so it must not be reachable off the machine.
-  _create_test_client(
+  client = _create_test_client(
       mock_session_service,
       mock_artifact_service,
       mock_memory_service,
@@ -832,6 +837,14 @@ def test_special_agents_allowed_only_on_loopback_web_server(
   )
 
   assert mock_agent_loader._allow_special_agents is expected
+  if not expected:
+    # Refused by the server itself, not by a 500 from the loader.
+    response = client.get(
+        "/apps/__adk_agent_builder_assistant/app-info",
+        headers={"host": "127.0.0.1:8000"},
+    )
+    assert response.status_code == 403
+    assert "internal special agents" in response.json()["detail"]
 
 
 @pytest.fixture
@@ -1512,6 +1525,55 @@ def test_agent_run_sse_unknown_app_returns_404(test_app, mock_agent_loader):
     response = test_app.post("/run_sse", json=payload)
     assert response.status_code == 404
     assert "Agent not found: unknown_app" in response.json()["detail"]
+
+
+def test_get_adk_app_info_load_failure_returns_500(test_app, mock_agent_loader):
+  """Test app-info returns 500, not 404, when the agent fails to load."""
+  with patch.object(
+      mock_agent_loader,
+      "load_agent",
+      side_effect=_AgentLoadError(
+          "Fail to load 'broken_app' module. ToolConfig"
+      ),
+  ):
+    response = test_app.get("/apps/broken_app/app-info")
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Failed to load agent"
+
+
+def test_get_adk_app_info_loader_http_error_is_preserved(
+    test_app, mock_agent_loader
+):
+  """Test a loader's own HTTPException keeps its status."""
+  with patch.object(
+      mock_agent_loader,
+      "load_agent",
+      side_effect=HTTPException(status_code=403, detail="Not your agent"),
+  ):
+    response = test_app.get("/apps/forbidden_app/app-info")
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Not your agent"
+
+
+def test_agent_run_sse_load_failure_returns_500(test_app, mock_agent_loader):
+  """Test /run_sse returns 500, not 404, when the agent fails to load."""
+  payload = {
+      "app_name": "broken_app",
+      "user_id": "test_user",
+      "session_id": "test_session",
+      "new_message": {"role": "user", "parts": [{"text": "Hello agent"}]},
+      "streaming": True,
+  }
+  with patch.object(
+      mock_agent_loader,
+      "load_agent",
+      side_effect=_AgentLoadError(
+          "Fail to load 'broken_app' module. ToolConfig"
+      ),
+  ):
+    response = test_app.post("/run_sse", json=payload)
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Failed to load agent"
 
 
 def test_create_session_with_id(test_app, test_session_info):
@@ -3890,21 +3952,21 @@ async def test_agent_run_sse_disconnect_with_cleanup_exception_and_cancellation(
     await task
 
 
-async def test_agent_run_sse_disconnect_seals_dangling_function_call(
-    create_test_session,
-    mock_session_service,
-    mock_agent_loader,
-    mock_eval_sets_manager,
-    mock_eval_set_results_manager,
-    monkeypatch,
-):
-  """Test that client disconnect during /run_sse aborts run and seals dangling FunctionCall."""
-  info = create_test_session
-  captured_contexts = []
-  tool_in_flight = asyncio.Event()
+def _slow_tool_app(
+    info,
+    captured_contexts,
+    tool_in_flight: asyncio.Event,
+    after_run_flag: asyncio.Event,
+    *,
+    call_id: str,
+) -> App:
+  """Builds an App with a slow-tool agent and an after_run recorder plugin."""
 
-  # Restore real Runner.run_async instead of the autouse dummy_run_async mock
-  monkeypatch.setattr(Runner, "run_async", _ORIGINAL_RUNNER_RUN_ASYNC)
+  class _AfterRunPlugin(BasePlugin):
+
+    async def after_run_callback(self, *, invocation_context):
+      del invocation_context
+      after_run_flag.set()
 
   class SlowToolAgent(BaseAgent):
 
@@ -3914,7 +3976,7 @@ async def test_agent_run_sse_disconnect_seals_dangling_function_call(
     async def _run_async_impl(self, invocation_context):
       captured_contexts.append(invocation_context)
       fc = types.Part.from_function_call(name="slow_tool", args={"q": "test"})
-      fc.function_call.id = "call_sse_1"
+      fc.function_call.id = call_id
       yield Event(
           invocation_id=invocation_context.invocation_id,
           author=self.name,
@@ -3923,9 +3985,38 @@ async def test_agent_run_sse_disconnect_seals_dangling_function_call(
       tool_in_flight.set()
       await asyncio.sleep(5.0)
 
-  slow_agent = SlowToolAgent("slow_tool_agent")
+  return App(
+      name=info["app_name"],
+      root_agent=SlowToolAgent("slow_tool_agent"),
+      plugins=[_AfterRunPlugin(name="after_run")],
+  )
+
+
+async def test_agent_run_sse_disconnect_seals_dangling_function_call(
+    create_test_session,
+    mock_session_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+    monkeypatch,
+):
+  """Test /run_sse disconnect aborts, seals FunctionCall, and runs after_run."""
+  info = create_test_session
+  captured_contexts = []
+  tool_in_flight = asyncio.Event()
+  after_run_flag = asyncio.Event()
+
+  # Restore real Runner.run_async instead of the autouse dummy_run_async mock
+  monkeypatch.setattr(Runner, "run_async", _ORIGINAL_RUNNER_RUN_ASYNC)
+  loaded_app = _slow_tool_app(
+      info,
+      captured_contexts,
+      tool_in_flight,
+      after_run_flag,
+      call_id="call_sse_1",
+  )
   monkeypatch.setattr(
-      mock_agent_loader, "load_agent", lambda app_name: slow_agent
+      mock_agent_loader, "load_agent", lambda app_name: loaded_app
   )
 
   client = _create_test_client(
@@ -3974,6 +4065,7 @@ async def test_agent_run_sse_disconnect_seals_dangling_function_call(
   assert any("slow_tool" in chunk for chunk in sent_chunks)
   assert len(captured_contexts) == 1
   assert captured_contexts[0].is_aborted is True
+  assert after_run_flag.is_set()
 
   # Verify the dangling FunctionCall was sealed with a synthetic FunctionResponse in session
   session = await mock_session_service.get_session(
@@ -6005,6 +6097,94 @@ def test_single_agent_mode_detection(
     assert response.json() == ["my_only_agent"]
 
 
+def test_single_agent_mode_loads_services_module_from_agent_dir(
+    tmp_path,
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+):
+  """Verify a services module in the agent folder registers custom services."""
+  agent_folder = tmp_path / "my_only_agent"
+  agent_folder.mkdir()
+  (agent_folder / "agent.py").write_text("root_agent = None")
+  (agent_folder / "services.py").write_text(
+      "from google.adk.cli.service_registry import get_service_registry\n"
+      "\n"
+      "\n"
+      "def _custom_session_factory(uri, **kwargs):\n"
+      "  return 'custom-session-service'\n"
+      "\n"
+      "\n"
+      "get_service_registry().register_session_service(\n"
+      "    'customscheme', _custom_session_factory\n"
+      ")\n"
+  )
+
+  original_sys_path = list(sys.path)
+  sys.modules.pop("services", None)
+
+  try:
+    # A fresh registry can only know the scheme if the agent's services.py ran.
+    with (
+        patch.object(
+            service_registry_module, "_service_registry_instance", None
+        ),
+        patch.object(signal, "signal", autospec=True, return_value=None),
+        patch.object(
+            fast_api_module,
+            "create_session_service_from_options",
+            autospec=True,
+            return_value=mock_session_service,
+        ),
+        patch.object(
+            fast_api_module,
+            "create_artifact_service_from_options",
+            autospec=True,
+            return_value=mock_artifact_service,
+        ),
+        patch.object(
+            fast_api_module,
+            "create_memory_service_from_options",
+            autospec=True,
+            return_value=mock_memory_service,
+        ),
+        patch.object(
+            fast_api_module,
+            "LocalEvalSetsManager",
+            autospec=True,
+            return_value=mock_eval_sets_manager,
+        ),
+        patch.object(
+            fast_api_module,
+            "LocalEvalSetResultsManager",
+            autospec=True,
+            return_value=mock_eval_set_results_manager,
+        ),
+    ):
+      get_fast_api_app(
+          agents_dir=str(agent_folder),
+          web=True,
+          session_service_uri="",
+          artifact_service_uri="",
+          memory_service_uri="",
+          allow_origins=None,
+          a2a=False,
+          host="127.0.0.1",
+          port=8000,
+      )
+
+      registry = service_registry_module.get_service_registry()
+      assert (
+          registry.create_session_service("customscheme://db")
+          == "custom-session-service"
+      )
+  finally:
+    sys.modules.pop("services", None)
+    sys.path[:] = original_sys_path
+
+
 def test_single_agent_mode_sets_default_app(
     tmp_path,
     mock_session_service,
@@ -6172,6 +6352,92 @@ def test_agent_run_disconnect_aborts_run(
   # Then the response status should be 499 and the running generator was cancelled
   assert response.status_code == 499
   assert was_cancelled["value"] is True
+
+
+async def test_agent_run_disconnect_seals_dangling_call_and_runs_after_run(
+    create_test_session,
+    mock_session_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+    monkeypatch,
+):
+  """Tests /run disconnect seals dangling FunctionCall and runs after_run."""
+  info = create_test_session
+  captured_contexts = []
+  tool_in_flight = asyncio.Event()
+  after_run_flag = asyncio.Event()
+
+  monkeypatch.setattr(Runner, "run_async", _ORIGINAL_RUNNER_RUN_ASYNC)
+  loaded_app = _slow_tool_app(
+      info,
+      captured_contexts,
+      tool_in_flight,
+      after_run_flag,
+      call_id="call_run_1",
+  )
+  monkeypatch.setattr(
+      mock_agent_loader, "load_agent", lambda app_name: loaded_app
+  )
+
+  client = _create_test_client(
+      mock_session_service,
+      InMemoryArtifactService(),
+      InMemoryMemoryService(),
+      mock_agent_loader,
+      mock_eval_sets_manager,
+      mock_eval_set_results_manager,
+  )
+  app = client.app
+  handler = None
+  for route in app.routes:
+    if route.path == "/run":
+      handler = route.endpoint
+      break
+  assert handler is not None
+
+  req = RunAgentRequest(
+      app_name=info["app_name"],
+      user_id=info["user_id"],
+      session_id=info["session_id"],
+      new_message={"role": "user", "parts": [{"text": "Run slow tool"}]},
+      streaming=False,
+  )
+
+  async def receive():
+    await tool_in_flight.wait()
+    return {"type": "http.disconnect"}
+
+  request = starlette.requests.Request(
+      {
+          "type": "http",
+          "method": "POST",
+          "path": "/run",
+          "headers": [],
+          "asgi": {"spec_version": "2.1"},
+      },
+      receive=receive,
+  )
+
+  response = await handler(req, request)
+  assert response.status_code == 499
+  assert len(captured_contexts) == 1
+  assert captured_contexts[0].is_aborted is True
+  assert after_run_flag.is_set()
+
+  session = await mock_session_service.get_session(
+      app_name=info["app_name"],
+      user_id=info["user_id"],
+      session_id=info["session_id"],
+  )
+  abort_events = [
+      e for e in session.events if e.error_code == "INVOCATION_ABORTED"
+  ]
+  assert len(abort_events) == 1
+  frs = abort_events[0].get_function_responses()
+  assert len(frs) == 1
+  assert frs[0].id == "call_run_1"
+  assert frs[0].name == "slow_tool"
 
 
 #################################################
@@ -6854,7 +7120,6 @@ def test_span_buffers_filled_when_web_enabled(
 
 
 def test_app_info_rejects_special_agent_only_in_api_server_mode(
-    test_app,
     mock_session_service,
     mock_artifact_service,
     mock_memory_service,
@@ -6877,9 +7142,21 @@ def test_app_info_rejects_special_agent_only_in_api_server_mode(
   assert blocked.status_code == 403
   assert "internal special agents" in blocked.json()["detail"]
 
-  # Same request on the dev server gets past the guard and is answered on the
-  # merits of the loaded agent (which here is not an LlmAgent).
-  allowed = test_app.get("/apps/__internal_assistant/app-info")
+  # Same request on a loopback-bound dev server gets past the guard and is
+  # answered on the merits of the loaded agent (which here is not an LlmAgent).
+  dev_client = _create_test_client(
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      mock_eval_sets_manager,
+      mock_eval_set_results_manager,
+      bind_host="127.0.0.1",
+  )
+  allowed = dev_client.get(
+      "/apps/__internal_assistant/app-info",
+      headers={"host": "127.0.0.1:8000"},
+  )
   assert allowed.status_code == 400
   assert allowed.json()["detail"] == "Root agent is not an LlmAgent"
 

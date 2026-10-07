@@ -1192,16 +1192,16 @@ class Runner:
     from .workflow._base_node import BaseNode
 
     if isinstance(self.agent, LlmAgent):
-      if self.agent.mode is None:
-        # LlmAgent as root agent defaults to chat mode.
-        self.agent.mode = 'chat'
+      # LlmAgent as root agent defaults to chat mode without mutating the
+      # shared agent instance in place.
+      effective_mode = self.agent.mode or 'chat'
 
       # A root LlmAgent runs in chat mode (the default) or task mode. Task mode
       # is fully supported for any caller: the agent runs to completion via the
       # finish_task tool and its result is promoted onto the terminal event's
       # output field (an A2A server turns that into an artifact; a direct caller
       # reads it off the event stream).
-      if self.agent.mode in ('chat', 'task'):
+      if effective_mode in ('chat', 'task'):
         session = await self._get_or_create_session(
             user_id=user_id,
             session_id=session_id,
@@ -1220,7 +1220,7 @@ class Runner:
       else:
         raise ValueError(
             "LlmAgent as root agent must have mode='chat' or 'task', but got"
-            f" mode='{self.agent.mode}'."
+            f" mode='{effective_mode}'."
         )
       async with aclosing(
           self._run_node_async(
@@ -1618,7 +1618,9 @@ class Runner:
       await _notify_run_error(plugin_manager, invocation_context, e)
       raise
     except asyncio.CancelledError as e:
-      if e.args and e.args[0] == _CALLER_CLOSED_EARLY_MSG:
+      if (
+          e.args and e.args[0] == _CALLER_CLOSED_EARLY_MSG
+      ) or invocation_context.is_aborted:
         closing_early = True
       else:
         run_error = e
@@ -1798,7 +1800,10 @@ class Runner:
     """Returns whether chat-mode root LlmAgent uses the legacy sub-agent picker."""
     from .agents.llm_agent import LlmAgent  # pylint: disable=g-import-not-at-top
 
-    if not isinstance(self.agent, LlmAgent) or self.agent.mode != 'chat':
+    if (
+        not isinstance(self.agent, LlmAgent)
+        or (self.agent.mode or 'chat') != 'chat'
+    ):
       return False
     remote_a2a_agent_class: tuple[Any, ...] = ()
     try:

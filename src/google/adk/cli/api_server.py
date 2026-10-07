@@ -108,6 +108,7 @@ from .cli_eval import _LEGACY_EVAL_SESSION_ID_PREFIX
 from .cli_eval import EVAL_SESSION_ID_PREFIX
 from .utils import cleanup
 from .utils import common
+from .utils.base_agent_loader import _AgentLoadError
 from .utils.base_agent_loader import BaseAgentLoader
 from .utils.shared_value import SharedValue
 
@@ -435,6 +436,23 @@ def _accepts_kwargs(func: Callable[..., Any], kwargs: dict[str, Any]) -> bool:
       return False
 
   return True
+
+
+def _with_abort_signal_kwarg(
+    runner: Runner,
+    kwargs: dict[str, Any],
+    abort_signal: asyncio.Event,
+) -> dict[str, Any]:
+  """Adds abort_signal to kwargs when runner.run_async accepts it."""
+  try:
+    params = inspect.signature(runner.run_async).parameters
+    if "abort_signal" in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    ):
+      kwargs["abort_signal"] = abort_signal
+  except (ValueError, TypeError):
+    kwargs["abort_signal"] = abort_signal
+  return kwargs
 
 
 _current_session_options: contextvars.ContextVar[Optional[dict[str, Any]]] = (
@@ -1023,10 +1041,7 @@ class ApiServer:
       return self.runner_dict[app_name]
 
     # Create new runner
-    try:
-      agent_or_app = self.agent_loader.load_agent(app_name)
-    except ValueError as ve:
-      raise HTTPException(status_code=404, detail=str(ve)) from ve
+    agent_or_app = self._load_agent_or_raise(app_name)
 
     if self.default_llm_model:
       from .cli import _override_default_llm_model
@@ -1108,6 +1123,29 @@ class ApiServer:
     runner = self._create_runner(agentic_app, app_name)
     self.runner_dict[app_name] = runner
     return runner
+
+  def _load_agent_or_raise(self, app_name: str) -> BaseAgent | App:
+    """Loads an agent, mapping a load failure onto an HTTP status code.
+
+    Args:
+      app_name: The name of the agent to load.
+
+    Returns:
+      The loaded agent or app.
+
+    Raises:
+      HTTPException: 404 when the loader raises ValueError, which means no agent
+        exists under the name. 500 when the agent's own module or config fails
+        to load, with a generic detail because that exception text can carry
+        paths or config; the traceback goes to the log instead.
+    """
+    try:
+      return self.agent_loader.load_agent(app_name)
+    except ValueError as e:
+      raise HTTPException(status_code=404, detail=str(e)) from e
+    except _AgentLoadError as e:
+      logger.exception("Failed to load agent %s", app_name)
+      raise HTTPException(status_code=500, detail="Failed to load agent") from e
 
   def _get_root_agent(self, agent_or_app: BaseAgent | App) -> BaseAgent:
     """Extract root agent from either a BaseAgent or App object."""
@@ -1580,10 +1618,7 @@ class ApiServer:
                 " mode."
             ),
         )
-      try:
-        agent_or_app = self.agent_loader.load_agent(app_name)
-      except ValueError as ve:
-        raise HTTPException(status_code=404, detail=str(ve)) from ve
+      agent_or_app = self._load_agent_or_raise(app_name)
       root_agent = self._get_root_agent(agent_or_app)
       if isinstance(root_agent, LlmAgent):
         return AppInfo(
@@ -2018,18 +2053,23 @@ class ApiServer:
             ),
         )
 
+      abort_signal = asyncio.Event()
+
       async def worker():
+        run_async_kwargs = _with_abort_signal_kwarg(
+            runner,
+            {
+                "user_id": req.user_id,
+                "session_id": req.session_id,
+                "new_message": req.new_message,
+                "state_delta": req.state_delta,
+                "invocation_id": req.invocation_id,
+                "run_config": run_config,
+            },
+            abort_signal,
+        )
         try:
-          async with Aclosing(
-              runner.run_async(
-                  user_id=req.user_id,
-                  session_id=req.session_id,
-                  new_message=req.new_message,
-                  state_delta=req.state_delta,
-                  invocation_id=req.invocation_id,
-                  run_config=run_config,
-              )
-          ) as agen:
+          async with Aclosing(runner.run_async(**run_async_kwargs)) as agen:
             return [public_event(event) async for event in agen]
         except SessionNotFoundError as e:
           raise HTTPException(status_code=404, detail=str(e)) from e
@@ -2045,6 +2085,7 @@ class ApiServer:
                   "Client disconnected. Aborting agent run for session %s.",
                   req.session_id,
               )
+              abort_signal.set()
               worker_task.cancel()
               break
         except asyncio.CancelledError:
@@ -2135,23 +2176,18 @@ class ApiServer:
 
         async def _produce_events() -> None:
           nonlocal is_closing, original_exc
-          run_async_kwargs: dict[str, Any] = {
-              "user_id": req.user_id,
-              "session_id": req.session_id,
-              "new_message": req.new_message,
-              "state_delta": req.state_delta,
-              "run_config": run_config,
-              "invocation_id": req.invocation_id,
-          }
-          try:
-            params = inspect.signature(runner.run_async).parameters
-            if "abort_signal" in params or any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
-            ):
-              run_async_kwargs["abort_signal"] = abort_signal
-          except (ValueError, TypeError):
-            run_async_kwargs["abort_signal"] = abort_signal
-
+          run_async_kwargs = _with_abort_signal_kwarg(
+              runner,
+              {
+                  "user_id": req.user_id,
+                  "session_id": req.session_id,
+                  "new_message": req.new_message,
+                  "state_delta": req.state_delta,
+                  "run_config": run_config,
+                  "invocation_id": req.invocation_id,
+              },
+              abort_signal,
+          )
           try:
             async with Aclosing(runner.run_async(**run_async_kwargs)) as agen:
               try:
