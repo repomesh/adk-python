@@ -33,13 +33,13 @@ from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import SpanProcessor
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.semconv._incubating.attributes.cloud_attributes import CLOUD_RESOURCE_ID as CLOUD_RESOURCE_ID
 from typing_extensions import override
 
 from ._agent_engine import _get_agent_engine_metrics_setup
 from ._agent_engine import telemetry_user_agent_headers
 from ._agent_engine_metric_exporter import MIN_EXPORT_INTERVAL_MS
 from ._gcp_resource import _fetch_project
-from ._gcp_resource import CLOUD_RESOURCE_ID as CLOUD_RESOURCE_ID
 from ._gcp_resource import get_gcp_resource as get_gcp_resource
 from .setup import OTelHooks
 
@@ -109,9 +109,9 @@ def get_gcp_exporters(
   """Returns GCP OTel exporters to be used in the app.
 
   Args:
-    enable_tracing: whether to enable tracing to Cloud Trace.
-    enable_metrics: whether to enable reporting metrics to Cloud Monitoring.
-    enable_logging: whether to enable sending logs to Cloud Logging.
+    enable_cloud_tracing: whether to enable tracing to Cloud Trace.
+    enable_cloud_metrics: whether to enable reporting metrics to Cloud Monitoring.
+    enable_cloud_logging: whether to enable sending logs to Cloud Logging.
     google_auth: optional custom credentials and project_id. google.auth.default() used when this is omitted.
   """
 

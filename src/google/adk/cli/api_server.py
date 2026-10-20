@@ -94,6 +94,7 @@ from ..models._service_tier import ServiceTier
 from ..plugins.base_plugin import BasePlugin
 from ..runners import Runner
 from ..sessions.base_session_service import BaseSessionService
+from ..sessions.base_session_service import GetSessionConfig
 from ..sessions.session import Session
 from ..telemetry._web_ui import WebUiLogExporter
 from ..telemetry.setup import maybe_set_otel_providers
@@ -891,7 +892,7 @@ def _setup_instrumentation_lib_if_installed() -> None:
   except ImportError:
     logger.warning(
         "Unable to import GoogleGenAiSdkInstrumentor - some"
-        " telemetry will be disabled. Make sure to install google-adk[otel-gcp]"
+        " telemetry will be disabled. Make sure to install google-adk[otel]"
     )
   if os.getenv("GOOGLE_CLOUD_AGENT_ENGINE_ID"):
     # Set up HTTPX and gRPC instrumentation for A2A multi-agent observability.
@@ -902,7 +903,7 @@ def _setup_instrumentation_lib_if_installed() -> None:
     except (ImportError, AttributeError):
       logger.warning(
           "telemetry enabled but proceeding without HTTPX instrumentation,"
-          " because google-adk[otel-gcp] has not been installed"
+          " because google-adk[otel] has not been installed"
       )
     try:
       from opentelemetry.instrumentation.grpc import GrpcInstrumentorClient
@@ -911,7 +912,7 @@ def _setup_instrumentation_lib_if_installed() -> None:
     except (ImportError, AttributeError):
       logger.warning(
           "telemetry enabled but proceeding without gRPC instrumentation,"
-          " because google-adk[otel-gcp] has not been installed"
+          " because google-adk[otel] has not been installed"
       )
 
 
@@ -1060,7 +1061,8 @@ class ApiServer:
           status_code=403,
           detail=(
               "Access to internal special agents is disabled in API server"
-              " mode."
+              " mode and on a development server not known to be bound to a"
+              " loopback address."
           ),
       )
     # Handle cleanup
@@ -1673,7 +1675,8 @@ class ApiServer:
             status_code=403,
             detail=(
                 "Access to internal special agents is disabled in API server"
-                " mode."
+                " mode and on a development server not known to be bound to a"
+                " loopback address."
             ),
         )
       agent_or_app = self._load_agent_or_raise(app_name)
@@ -2217,6 +2220,7 @@ class ApiServer:
             app_name=req.app_name,
             user_id=req.user_id,
             session_id=req.session_id,
+            config=GetSessionConfig(num_recent_events=0),
         )
         if not session:
           raise HTTPException(

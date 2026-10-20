@@ -49,6 +49,7 @@ from google.adk.events._internal_metadata import INTERNAL_METADATA_PREFIX
 from google.adk.events._internal_metadata import RESTORED_EVENT_KEY
 from google.adk.events.event import Event
 from google.adk.events.event import EventActions
+from google.adk.models.google_llm import Gemini
 from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.runners import Runner
 from google.adk.sessions.base_session_service import BaseSessionService
@@ -57,6 +58,7 @@ from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.sessions.session import Session
 from google.adk.tools.agent_tool import AgentTool
 from google.adk.tools.base_toolset import BaseToolset
+from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.long_running_tool import LongRunningFunctionTool
 from google.adk.workflow import BaseNode
 from google.adk.workflow import node
@@ -6743,6 +6745,187 @@ async def test_run_async_tool_error_in_root_parallel_agent_keeps_each_author():
     await _run_turn(runner, "s", "Run")
 
   assert await _kept_authors(runner, "fast_tool") == ["a", "b"]
+
+
+@pytest.mark.parametrize("resumable", [False, True])
+@pytest.mark.parametrize("answer", ["new_message", "approve", "reject"])
+@pytest.mark.asyncio
+async def test_run_async_paused_single_turn_agent_returns_turn_to_delegator(
+    answer: str, resumable: bool
+):
+  """A single_turn agent paused on a confirmation does not take later turns."""
+  paid = []
+
+  def pay(amount: int) -> dict[str, int]:
+    """Pays an amount."""
+    paid.append(amount)
+    return {"paid": amount}
+
+  helper = LlmAgent(
+      name="helper",
+      mode="single_turn",
+      model=testing_utils.MockModel.create(
+          responses=[
+              types.Part.from_function_call(name="pay", args={"amount": 5}),
+              "Helper done",
+              "Helper chatting",
+          ]
+      ),
+      tools=[FunctionTool(pay, require_confirmation=True)],
+  )
+  root = LlmAgent(
+      name="root_agent",
+      model=testing_utils.MockModel.create(
+          responses=[
+              types.Part.from_function_call(
+                  name="helper", args={"request": "pay 5"}
+              ),
+              "Root reply",
+              "Root thanks",
+          ]
+      ),
+      sub_agents=[helper],
+  )
+  runner = _abort_runner(root, resumable=resumable)
+
+  first, _ = await _run_turn(runner, "s", "Pay 5")
+  confirmation_id = next(
+      fc.id
+      for e in first
+      for fc in e.get_function_calls()
+      if fc.name == "adk_request_confirmation"
+  )
+  if answer == "new_message":
+    message = types.Content(role="user", parts=[types.Part(text="Weather?")])
+  else:
+    message = types.Content(
+        role="user",
+        parts=[
+            types.Part(
+                function_response=types.FunctionResponse(
+                    id=confirmation_id,
+                    name="adk_request_confirmation",
+                    response={"confirmed": answer == "approve"},
+                )
+            )
+        ],
+    )
+  second = [
+      e
+      async for e in runner.run_async(
+          user_id=TEST_USER_ID, session_id="s", new_message=message
+      )
+  ]
+  third, _ = await _run_turn(runner, "s", "Thanks")
+
+  assert paid == ([5] if answer == "approve" else [])
+  assert _texts([e.content for e in second if e.author == "root_agent"]) == [
+      "Root reply"
+  ]
+  assert "Helper chatting" not in _texts([e.content for e in second + third])
+  assert _texts([e.content for e in third]) == ["Root thanks"]
+  assert {e.author for e in third if e.content} == {"root_agent"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gemini-2.5-flash",
+        "gemini-3.5-flash",
+        "gemini-4.0-flash",
+        "projects/p/locations/us-central1/publishers/google/models/gemini-3.5-flash",
+    ],
+)
+async def test_cfc_is_supported_on_gemini_models(model):
+  """Tests that CFC accepts gemini-* ids, bare and as a Vertex publisher path."""
+  session_service = InMemorySessionService()
+  runner = Runner(
+      app_name=TEST_APP_ID,
+      agent=LlmAgent(name="test_agent", model=model),
+      session_service=session_service,
+      artifact_service=InMemoryArtifactService(),
+  )
+  session = await session_service.create_session(
+      app_name=TEST_APP_ID, user_id=TEST_USER_ID
+  )
+
+  invocation_context = runner._new_invocation_context(
+      session, run_config=RunConfig(support_cfc=True)
+  )
+
+  assert invocation_context.run_config.support_cfc
+
+
+@pytest.mark.asyncio
+async def test_cfc_is_rejected_on_non_gemini_models():
+  """Tests that CFC is refused for a model that is not Gemini."""
+  session_service = InMemorySessionService()
+  runner = Runner(
+      app_name=TEST_APP_ID,
+      agent=LlmAgent(
+          name="test_agent", model=testing_utils.MockModel.create(responses=[])
+      ),
+      session_service=session_service,
+      artifact_service=InMemoryArtifactService(),
+  )
+  session = await session_service.create_session(
+      app_name=TEST_APP_ID, user_id=TEST_USER_ID
+  )
+
+  with pytest.raises(ValueError, match="CFC is not supported"):
+    runner._new_invocation_context(
+        session, run_config=RunConfig(support_cfc=True)
+    )
+
+
+@pytest.mark.asyncio
+async def test_cfc_is_rejected_on_gemini_model_without_live_support():
+  """Tests that a Gemini-named model that cannot connect is refused."""
+  from google.adk.models.lite_llm import LiteLlm
+
+  session_service = InMemorySessionService()
+  runner = Runner(
+      app_name=TEST_APP_ID,
+      agent=LlmAgent(
+          name="test_agent", model=LiteLlm(model="gemini/gemini-2.5-flash")
+      ),
+      session_service=session_service,
+      artifact_service=InMemoryArtifactService(),
+  )
+  session = await session_service.create_session(
+      app_name=TEST_APP_ID, user_id=TEST_USER_ID
+  )
+
+  with pytest.raises(ValueError, match="CFC is not supported"):
+    runner._new_invocation_context(
+        session, run_config=RunConfig(support_cfc=True)
+    )
+
+
+@pytest.mark.asyncio
+async def test_cfc_is_supported_on_endpoint_id_when_check_disabled(monkeypatch):
+  """Tests that ADK_DISABLE_GEMINI_MODEL_ID_CHECK unblocks endpoint ids."""
+  monkeypatch.setenv("ADK_DISABLE_GEMINI_MODEL_ID_CHECK", "true")
+  session_service = InMemorySessionService()
+  runner = Runner(
+      app_name=TEST_APP_ID,
+      agent=LlmAgent(
+          name="test_agent",
+          model=Gemini(model="projects/p/locations/us-central1/endpoints/123"),
+      ),
+      session_service=session_service,
+      artifact_service=InMemoryArtifactService(),
+  )
+  session = await session_service.create_session(
+      app_name=TEST_APP_ID, user_id=TEST_USER_ID
+  )
+
+  invocation_context = runner._new_invocation_context(
+      session, run_config=RunConfig(support_cfc=True)
+  )
+
+  assert invocation_context.run_config.support_cfc
 
 
 if __name__ == "__main__":

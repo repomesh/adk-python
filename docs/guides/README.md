@@ -20,12 +20,13 @@ This directory contains specific developer guides for the ADK Python implementat
 * [LlmAgent Task Mode](agents/llm_agent/task.md) - Guide on using LlmAgent in task mode.
 * [ManagedAgent](agents/managed_agent/index.md) - Guide on using ManagedAgent with server-side tools.
 * [RemoteA2aAgent Task Mode](agents/remote_a2a_agent/task.md) - Guide on using RemoteA2aAgent in task mode.
+* [RunConfig](agents/run_config/index.md) - Per-invocation streaming, concurrency, session window, telemetry, and live audio settings.
 
 ### Apps
 * [App](apps/app/index.md) - The top-level container binding a root agent to app-wide plugins and configuration.
 
 ### Artifacts
-* [BaseArtifactService](artifacts/artifact_service/index.md) - Storing binary payloads outside the conversation history, with versioning and user-scoped filenames.
+* [BaseArtifactService](artifacts/artifact_service/index.md) - Storing binary payloads outside the conversation history, with versioning, user-scoped filenames, and GCS URL generation.
 
 ### Auth
 * [AuthConfig and authenticated tools](auth/tool_auth/index.md) - Declaring the credentials a tool needs, and the pause-for-consent handshake.
