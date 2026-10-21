@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for _live_llm_flow helper module and its BaseLlmFlow shims."""
+"""Unit tests for the _live_llm_flow helper module."""
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from unittest import mock
 
 from google.adk.agents.invocation_context import InvocationContext
@@ -32,8 +33,12 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.sessions.session import Session
+from google.adk.tools.set_model_response_tool import SetModelResponseTool
 from google.genai import types
+from pydantic import BaseModel
 import pytest
+
+from .. import testing_utils
 
 
 class _TestBaseLlmFlow(BaseLlmFlow):
@@ -333,25 +338,6 @@ async def test_screen_live_user_content_returns_blocked_event():
   assert blocked_event.content == blocked_response.content
 
 
-async def test_base_llm_flow_forwarding_shims():
-  """BaseLlmFlow shims delegate to _live_llm_flow while preserving caller interface."""
-  flow = _TestBaseLlmFlow()
-  context = _create_test_context(live_request_queue=LiveRequestQueue())
-  update = types.LiveServerSessionResumptionUpdate(new_handle='shim-handle')
-  response = LlmResponse(live_session_resumption_update=update)
-  event = Event(id='e-shim', invocation_id=context.invocation_id)
-
-  events = [
-      e
-      async for e in flow._postprocess_live(
-          context, LlmRequest(), response, event
-      )
-  ]
-
-  assert len(events) == 1
-  assert events[0].live_session_resumption_update == update
-
-
 async def test_stop_background_tool_tasks_uses_timeout():
   """stop_background_tool_tasks uses _TOOL_SHUTDOWN_TIMEOUT_SECONDS."""
   from google.adk.live import _flow_utils
@@ -558,3 +544,108 @@ def test_audio_cache_manager_alias_points_to_realtime_cache_manager():
   flow = _TestBaseLlmFlow()
 
   assert flow.audio_cache_manager is flow._realtime_cache_manager
+
+
+class _WeatherReport(BaseModel):
+  city: str
+  temperature_celsius: float
+
+
+def _get_weather(city: str) -> dict[str, object]:
+  """Returns the weather in a city.
+
+  Args:
+    city: The city name.
+  """
+  return {'city': city, 'temperature_celsius': 26}
+
+
+def test_run_live_ignores_output_schema(caplog):
+  """A live session gets no set_model_response tool and logs a warning."""
+  mock_model = testing_utils.MockModel.create([LlmResponse(turn_complete=True)])
+  agent = LlmAgent(
+      name='weather_agent',
+      model=mock_model,
+      tools=[_get_weather],
+      output_schema=_WeatherReport,
+  )
+  runner = testing_utils.InMemoryRunner(
+      root_agent=agent, response_modalities=['AUDIO']
+  )
+  live_request_queue = LiveRequestQueue()
+  live_request_queue.send_realtime(
+      blob=types.Blob(data=b'\x00\xFF', mime_type='audio/pcm')
+  )
+
+  with caplog.at_level(logging.WARNING):
+    runner.run_live(live_request_queue)
+
+  llm_request = mock_model.requests[0]
+  assert SetModelResponseTool.NAME not in llm_request.tools_dict
+  assert SetModelResponseTool.NAME not in (
+      llm_request.config.system_instruction or ''
+  )
+  assert 'not supported in live mode' in caplog.text
+
+
+def test_run_live_does_not_warn_for_task_mode_output_schema(caplog):
+  """A task-mode agent reports output via finish_task, so no warning."""
+  mock_model = testing_utils.MockModel.create([LlmResponse(turn_complete=True)])
+  agent = LlmAgent(
+      name='weather_agent',
+      model=mock_model,
+      mode='task',
+      tools=[_get_weather],
+      output_schema=_WeatherReport,
+  )
+  runner = testing_utils.InMemoryRunner(
+      root_agent=agent, response_modalities=['AUDIO']
+  )
+  live_request_queue = LiveRequestQueue()
+  live_request_queue.send_realtime(
+      blob=types.Blob(data=b'\x00\xFF', mime_type='audio/pcm')
+  )
+
+  with caplog.at_level(logging.WARNING):
+    runner.run_live(live_request_queue)
+
+  assert mock_model.requests
+  assert 'not supported in live mode' not in caplog.text
+
+
+async def test_postprocess_live_flow_does_not_synthesize_structured_response():
+  """A set_model_response call yields only the call and its response."""
+  flow = _TestBaseLlmFlow()
+  context = _create_test_context(live_request_queue=LiveRequestQueue())
+  llm_request = LlmRequest()
+  llm_request.append_tools([SetModelResponseTool(_WeatherReport)])
+  response = LlmResponse(
+      content=types.Content(
+          role='model',
+          parts=[
+              types.Part(
+                  function_call=types.FunctionCall(
+                      id='call-1',
+                      name=SetModelResponseTool.NAME,
+                      args={'city': 'Tokyo', 'temperature_celsius': 26},
+                  )
+              )
+          ],
+      )
+  )
+  event = Event(
+      id='ev-1',
+      invocation_id=context.invocation_id,
+      author=context.agent.name,
+  )
+
+  events = [
+      e
+      async for e in _live_llm_flow.postprocess_live_flow(
+          flow, context, llm_request, response, event
+      )
+  ]
+
+  assert len(events) == 2
+  assert events[0].get_function_calls()
+  assert events[1].get_function_responses()

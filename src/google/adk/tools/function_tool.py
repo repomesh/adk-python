@@ -18,6 +18,7 @@ import functools
 import inspect
 import logging
 import re
+from types import TracebackType
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -36,8 +37,10 @@ from ..features import is_feature_enabled
 from ..utils import _schema_utils
 from ..utils._callable_utils import CallableSpec
 from ..utils._callable_utils import unwrap_callable
+# Re-exported for callers importing from `function_tool`.
 from ..utils._sync_runner import _invoke_callable
-from ..utils._sync_runner import _use_sync_callable_runner as _use_sync_callable_runner
+from ..utils._sync_runner import _use_sync_callable_context
+from ..utils._sync_runner import _use_sync_callable_runner  # noqa: F401
 from ..utils.variant_utils import GoogleLLMVariant
 from ._automatic_function_calling_util import build_function_declaration
 from .base_tool import BaseTool
@@ -411,10 +414,13 @@ class FunctionTool(BaseTool):
       args_to_call = self._prepare_invocation_args(
           preprocessed_args, tool_context
       )
-      return cast(
-          bool,
-          await self._invoke_callable(self._require_confirmation, args_to_call),
-      )
+      with _use_sync_callable_context(tool_context):
+        return cast(
+            bool,
+            await self._invoke_callable(
+                self._require_confirmation, args_to_call
+            ),
+        )
     return bool(self._require_confirmation)
 
   def _is_invocation_type_error(
@@ -435,7 +441,7 @@ class FunctionTool(BaseTool):
       target_code = getattr(target.__call__, "__code__", None)
 
     if target_code is not None:
-      curr = tb
+      curr: Optional[TracebackType] = tb
       while curr:
         if curr.tb_frame.f_code is target_code:
           return False
@@ -527,7 +533,8 @@ You could retry calling this tool, but it is IMPORTANT for you to provide all th
         return await self._run_generator_as_node(
             args_to_call=args_to_call, tool_context=tool_context
         )
-      return await self._invoke_callable(self.func, args_to_call)
+      with _use_sync_callable_context(tool_context):
+        return await self._invoke_callable(self.func, args_to_call)
     except TypeError as e:
       if not self._spec.has_signature and self._is_invocation_type_error(
           e, self.func
