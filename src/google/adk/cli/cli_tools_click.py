@@ -1096,6 +1096,15 @@ def adk_services_options(
     ),
     default=None,
 )
+@click.option(
+    "--reload_agents",
+    is_flag=True,
+    default=False,
+    help=(
+        "Optional. Watch the agent folder for .py/.yaml/.yml changes and"
+        " hot-reload the agent in interactive mode."
+    ),
+)
 @click.argument(
     "agent",
     type=click.Path(
@@ -1121,6 +1130,7 @@ def cli_run(
     default_llm_model: Optional[str] = None,
     log_level: str = "INFO",
     state_file: Optional[str] = None,
+    reload_agents: bool = False,
 ) -> None:
   """Runs an agent. If no query is provided, enters interactive mode.
 
@@ -1195,6 +1205,7 @@ def cli_run(
             timeout=timeout,
             in_memory=in_memory,
             jsonl=jsonl,
+            reload_agents=reload_agents,
             session_service_uri=session_service_uri,
             artifact_service_uri=artifact_service_uri,
             memory_service_uri=memory_service_uri,
@@ -2668,10 +2679,12 @@ def cli_api_server(
     help=(
         "Optional. Additional local package paths (a file or directory) to"
         " stage and deploy alongside the agent, and make importable in the"
-        " deployed image. Each entry is placed at `/app/<basename>` and `/app`"
-        " is added to PYTHONPATH, so a top-level name that matches an installed"
-        " dependency will shadow it at runtime; pick distinct names."
-        " Repeatable."
+        " deployed image. A wheel (.whl), source archive (.tar.gz, .tgz,"
+        " .zip), or a project directory containing pyproject.toml or setup.py"
+        " (without a root __init__.py) is installed with pip. Any other entry"
+        " is placed at `/app/<basename>` and `/app` is added to PYTHONPATH, so"
+        " a top-level name that matches an installed dependency will shadow it"
+        " at runtime; pick distinct names. Repeatable."
     ),
 )
 @deploy_options
@@ -3102,10 +3115,12 @@ def cli_migrate_session(
     help=(
         "Optional. Additional local package paths (a file or directory) to"
         " stage and deploy alongside the agent, and make importable in the"
-        " deployed image. Each entry is placed at `/app/<basename>` and `/app`"
-        " is added to PYTHONPATH, so a top-level name that matches an installed"
-        " dependency will shadow it at runtime; pick distinct names."
-        " Repeatable."
+        " deployed image. A wheel (.whl), source archive (.tar.gz, .tgz,"
+        " .zip), or a project directory containing pyproject.toml or setup.py"
+        " (without a root __init__.py) is installed with pip. Any other entry"
+        " is placed at `/app/<basename>` and `/app` is added to PYTHONPATH, so"
+        " a top-level name that matches an installed dependency will shadow it"
+        " at runtime; pick distinct names. Repeatable."
     ),
 )
 @click.option(
@@ -3405,10 +3420,12 @@ def cli_deploy_agent_engine(
     help=(
         "Optional. Additional local package paths (a file or directory) to"
         " stage and deploy alongside the agent, and make importable in the"
-        " deployed image. Each entry is placed at `/app/<basename>` and `/app`"
-        " is added to PYTHONPATH, so a top-level name that matches an installed"
-        " dependency will shadow it at runtime; pick distinct names."
-        " Repeatable."
+        " deployed image. A wheel (.whl), source archive (.tar.gz, .tgz,"
+        " .zip), or a project directory containing pyproject.toml or setup.py"
+        " (without a root __init__.py) is installed with pip. Any other entry"
+        " is placed at `/app/<basename>` and `/app` is added to PYTHONPATH, so"
+        " a top-level name that matches an installed dependency will shadow it"
+        " at runtime; pick distinct names. Repeatable."
     ),
 )
 @adk_services_options(default_use_local_storage=False)
