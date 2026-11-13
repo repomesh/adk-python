@@ -307,13 +307,13 @@ _CALL_COUNT_BUCKET_BOUNDS = [
 
 _invoke_agent_inference_calls = meter.create_histogram(
     "gen_ai.invoke_agent.inference_calls",
-    unit="1",
+    unit="{inference_call}",
     description="Number of inference (model) calls per agent invocation.",
     explicit_bucket_boundaries_advisory=_CALL_COUNT_BUCKET_BOUNDS,
 )
 _invoke_agent_tool_calls = meter.create_histogram(
     "gen_ai.invoke_agent.tool_calls",
-    unit="1",
+    unit="{tool_call}",
     description="Number of tool calls per agent invocation.",
     explicit_bucket_boundaries_advisory=_CALL_COUNT_BUCKET_BOUNDS,
 )
@@ -955,6 +955,7 @@ def _get_provider_name(model: str | None) -> str:
 def get_elapsed_s(
     span: Span | GenerateContentSpan | None,
     fallback_start: float,
+    fallback_end: float | None = None,
 ) -> float:
   """Guarantees consistent time source for duration calculation.
 
@@ -964,12 +965,16 @@ def get_elapsed_s(
     span (trace.Span | tracing.GenerateContentSpan | None): The ended span to
       extract duration from.
     fallback_start (float): Fallback start time in seconds (monotonic).
+    fallback_end (float | None): Fallback end time in seconds (monotonic).
+      Defaults to now.
 
   Returns:
     float: Elapsed duration in seconds.
   """
+  if fallback_end is None:
+    fallback_end = time.monotonic()
   if span is None:
-    return time.monotonic() - fallback_start
+    return fallback_end - fallback_start
 
   span = span.span if hasattr(span, "span") else span
   start_ns = getattr(span, "start_time", None)
@@ -979,7 +984,7 @@ def get_elapsed_s(
     return (end_ns - start_ns) / 1e9  # Convert ns to s
 
   # Fallback if span times are missing
-  return time.monotonic() - fallback_start
+  return fallback_end - fallback_start
 
 
 @experimental_telemetry(gate="skills")
