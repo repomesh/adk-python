@@ -12,16 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Utility modules for Agent Builder Assistant."""
+"""Scopes an environment can keep its resources in."""
 
 from __future__ import annotations
 
-from .adk_source_utils import find_adk_source_folder
-from .adk_source_utils import get_adk_schema_path
-from .adk_source_utils import load_agent_config_schema
+import enum
 
-__all__ = [
-    'load_agent_config_schema',
-    'find_adk_source_folder',
-    'get_adk_schema_path',
-]
+
+class EnvironmentScope(str, enum.Enum):
+  """Which agent runs share one resource of an environment.
+
+  A resource is whatever ``initialize`` sets up, such as a sandbox or a
+  working directory.
+  """
+
+  SHARED = "shared"
+  """All runs that use the environment instance share one resource."""
+
+  USER = "user"
+  """Each user has their own resource, shared by all sessions of the user."""
+
+  SESSION = "session"
+  """Each session has its own resource."""
